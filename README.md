@@ -22,6 +22,11 @@ SWE-bench Verified. Linear project: **Agent Benchmarking** (HIVE).
 | `run_swebench.sh` | HIVE-264 | Run the harness on the pilot subset (Arm A control) |
 | `pilot_filter.py` | HIVE-264 | Emit the `--filter` regex matching exactly the pinned 30 |
 | `grade_swebench.sh` | HIVE-264 | Grade a run's `preds.json` against the hidden tests (resolved/unresolved) |
+| `ARM_B.md` | HIVE-265/268 | Arm-B (NeoHive treatment) design + open items |
+| `index_instance.py` | HIVE-268 | Clone repo @ `base_commit` → contamination guard → index into a per-instance NeoHive hive |
+| `neohive_search.py` | HIVE-265 | In-container retrieval shim: `memory_recall` over the instance's hive via MCP |
+| `config/arm_b_neohive.yaml` | HIVE-265 | mini-swe-agent overlay adding the shim + host networking (and nothing else) |
+| `run_arm_b.sh` | HIVE-265/268 | Arm-B orchestrator: per-instance index → run → merge into one `preds.json` |
 
 ## Scaffold: mini-swe-agent
 We use **mini-swe-agent** (the SWE-bench team's ~100-LOC, bash-only agent) as the

@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 results/
 logs/
+.localdata/
 .env
 *.env
 

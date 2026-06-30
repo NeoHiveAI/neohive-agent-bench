@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -100,15 +101,25 @@ def index_instance(instance_id: str) -> str:
     return line.split("=", 1)[1].strip()
 
 
-def write_arm_config(arm: str, project: str | None) -> Path:
+def build_config_dir(arm: str, project: str | None) -> Path:
+    """Assemble the container's /root/.config/opencode/ contents for this arm.
+
+    Arm A: just opencode.json (permissions, no NeoHive). Arm B: opencode.json
+    (permissions + MCP + instructions + plugin refs) plus the full faithful NeoHive
+    setup (instructions/, plugin/ x2, agents/, skill/) from config/neohive-opencode/.
+    """
+    d = Path(tempfile.mkdtemp())
     raw = (HERE / "config" / f"opencode-arm-{arm}.json").read_text()
     if arm == "b":
         if not project:
             raise SystemExit("Arm B needs NEOHIVE_PROJECT")
         raw = raw.replace("__NEOHIVE_PROJECT__", project)
-    f = Path(tempfile.mkdtemp()) / "opencode.json"
-    f.write_text(raw)
-    return f
+        src = HERE / "config" / "neohive-opencode"
+        for sub in ("instructions", "plugin", "agents", "skill"):
+            if (src / sub).exists():
+                shutil.copytree(src / sub, d / sub)
+    (d / "opencode.json").write_text(raw)
+    return d
 
 
 def run_instance(instance_id: str, arm: str, model: str, ocbin: str, out_dir: Path,
@@ -121,13 +132,15 @@ def run_instance(instance_id: str, arm: str, model: str, ocbin: str, out_dir: Pa
         purge_project_hives()                 # ensure recall can't fan to other instances
         hive_id = index_instance(instance_id)  # index repo@base_commit, code embeddings
 
-    cfg = write_arm_config(arm, project)
+    cfgdir = build_config_dir(arm, project)
     print(f"[run] arm={arm} {instance_id} model={model} image={image}")
     cid = docker("run", "-d", "--rm", "-v", f"{ocbin}:/opt/oc/opencode:ro",
                  image, "sleep", str(timeout + 600)).stdout.strip()
     try:
         docker("exec", cid, "mkdir", "-p", "/root/.config/opencode")
-        docker("cp", str(cfg), f"{cid}:/root/.config/opencode/opencode.json")
+        docker("cp", f"{cfgdir}/.", f"{cid}:/root/.config/opencode/")
+        # smart-prompts shells out to `opencode` for the rewriter; put it on PATH.
+        docker("exec", cid, "ln", "-sf", "/opt/oc/opencode", "/usr/local/bin/opencode", check=False)
 
         env_flags = ["-e", "OPENROUTER_API_KEY"]
         if arm == "b":

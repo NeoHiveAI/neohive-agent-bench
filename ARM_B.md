@@ -10,13 +10,24 @@ Arm A vs Arm B resolved rates per model is the whole experiment.
 
 The scaffold is **opencode** (model-agnostic via OpenRouter, MCP-native), run
 **inside** each SWE-bench container so the agent has the repo's deps and can run
-tests. Arm A and Arm B are the *same* opencode setup; the **only** difference is one
-config key:
+tests. Both arms are the same opencode + model; the difference is NeoHive:
 
-- **Arm A** — `config/opencode-arm-a.json` (`permission: {"*":"allow"}`, no MCP).
-- **Arm B** — `config/opencode-arm-b.json` — identical plus an `mcp.neohive` remote
-  server pointing at the instance's NeoHive project, with the Cloudflare Access
-  service token in `headers`. The model then *chooses* to call NeoHive's MCP tools.
+- **Arm A** — `config/opencode-arm-a.json` (`permission: {"*":"allow"}`, nothing else).
+- **Arm B** — the **full faithful NeoHive end-user setup** — everything
+  `/neohive:getting-started` provisions, with every feature enabled. The official
+  NeoHive opencode port (the team's adaptation of `NeoHiveAI/NeoHiveClaude`) is
+  committed under `config/neohive-opencode/` and assembled into the container's
+  `/root/.config/opencode/`:
+  - `mcp.neohive` remote server (instance's project, CF service token in `headers`);
+  - `instructions/neohive.md` — usage rules auto-loaded every session;
+  - `plugin/neohive.ts` — glob/grep→`memory_recall` nudge;
+  - `plugin/neohive-smart-prompts.ts` — the `enable-smart-prompts` auto-context layer
+    (rewrite prompt → `memory_recall` → filter → inject), adapted for CF + OpenRouter;
+  - `agents/explore-neohive.md` — recall-first exploration subagent;
+  - `skill/*` — the NeoHive skills.
+
+  This is "NeoHive exactly as a power-user end-user would have it," committed in full
+  so the setup is transparent and critiquable (see `config/neohive-opencode/PROVENANCE.md`).
 
 This replaces the earlier hand-rolled `neohive-search` bash shim, which only
 measured "agent runs a command we told it to" rather than "agent uses NeoHive like
@@ -37,8 +48,9 @@ shows `neohive connected` through CF → `opencode run` with `glm-4.6` calls
 |---|---|
 | `index_instance.py` | HIVE-268: clone repo @ `base_commit` → branch → contamination guard → publish public mirror → create + index a per-instance code-embedding NeoHive hive. |
 | `fetch_opencode.sh` | Fetch the pinned opencode linux-x64 binary (mounted into every container). |
-| `config/opencode-arm-a.json` / `-arm-b.json` | The two opencode configs; they differ **only** by the `mcp.neohive` block. |
-| `run_opencode.py` | Per-instance, per-arm runner: `docker run` the image with opencode mounted → `docker cp` the arm config → `opencode run "<problem_statement>"` in `/testbed` → `git diff` → `preds.json`. Arm B purges + indexes the hive (temporal isolation) and deletes it after. Grade with `grade_swebench.sh`. |
+| `config/opencode-arm-a.json` / `-arm-b.json` | The two opencode `opencode.json` configs (Arm A bare; Arm B adds mcp + instructions + plugin refs). |
+| `config/neohive-opencode/` | The full faithful NeoHive opencode setup committed for transparency (rules, both plugins incl. smart-prompts, explore-neohive subagent, skills) + `PROVENANCE.md`. Arm B only. |
+| `run_opencode.py` | Per-instance, per-arm runner: `docker run` the image with opencode mounted → assemble + `docker cp` the arm's `/root/.config/opencode/` → `opencode run "<problem_statement>"` in `/testbed` → `git diff` → `preds.json`. Arm B purges + indexes the hive (temporal isolation) and deletes it after. Grade with `grade_swebench.sh`. |
 
 ## Contamination guard — structural, and validated
 
@@ -131,13 +143,15 @@ recreate — change it in place in the FE (triggers re-embed) or `POST …/re-em
 
 ## Remaining
 
-- **First A/B** — `run_opencode.py` is built (helpers validated; the in-container
-  opencode+MCP flow is validated). Run both arms on `psf__requests-1142` and compare
-  resolved-rate, then expand to the pilot.
-- **Methodology — Arm-B usage nudge?** Decide whether Arm B should include a brief
-  "a semantic memory of this repo is available via the neohive MCP tools" instruction
-  (mirroring NeoHive's end-user CLAUDE.md rules/hooks) or stay identical-prompt
-  (single variable; the model uses the MCP tools only if it chooses).
+- **First A/B** — `run_opencode.py` is built (helpers + full-faithful config assembly
+  validated; the in-container opencode+MCP flow is validated). Run both arms on
+  `psf__requests-1142` and compare resolved-rate, then expand to the pilot. First real
+  run still needs to confirm: the smart-prompts nested `opencode run` calls work under
+  emulation, and the agent edits files headlessly (permission `{"*":"allow"}`).
+- **Methodology — RESOLVED:** Arm B = the full faithful end-user setup with **every
+  feature enabled** (rules + grep-nudge + smart-prompts auto-context + explore-neohive
+  + skills), committed under `config/neohive-opencode/`. Not a stripped single-variable
+  setup — the comparison is "NeoHive as a power-user has it" vs baseline.
 - **Submodule wiring.** Embed each mirror as a submodule (`indexed/<instance_id>`,
   pinned at `base_commit`) in this bench repo — the public audit trail.
 - **Scale + publish-method.** `index_instance.py` full-clones + pushes per upstream

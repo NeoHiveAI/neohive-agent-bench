@@ -118,10 +118,21 @@ def contamination_guard(repo_dir: Path, gold_patch: str, test_patch: str) -> Non
 def _neohive_req(method: str, path: str, body: dict | None = None) -> dict:
     base = os.environ["NEOHIVE_BASE"].rstrip("/")
     project = os.environ["NEOHIVE_PROJECT"]
-    pat = os.environ.get("NEOHIVE_PAT", "")
-    headers = {"Content-Type": "application/json", "X-HiveMind-Id": project}
-    if pat:
-        headers["Authorization"] = f"Bearer {pat}"
+    headers = {
+        "Content-Type": "application/json",
+        "X-HiveMind-Id": project,
+        # CF WAF blocks the default Python-urllib UA (Error 1010); any UA passes.
+        "User-Agent": "neohive-agent-bench/0.1",
+    }
+    # Hosted NeoHive sits behind Cloudflare Access (no Auth0/PAT); the CF service
+    # token gets past CF, after which NeoHive attaches owner context itself.
+    cf_id = os.environ.get("NEOHIVE_CF_ACCESS_CLIENT_ID")
+    cf_secret = os.environ.get("NEOHIVE_CF_ACCESS_CLIENT_SECRET")
+    if cf_id and cf_secret:
+        headers["CF-Access-Client-Id"] = cf_id
+        headers["CF-Access-Client-Secret"] = cf_secret
+    if os.environ.get("NEOHIVE_PAT"):
+        headers["Authorization"] = f"Bearer {os.environ['NEOHIVE_PAT']}"
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(f"{base}{path}", data=data, headers=headers, method=method)
     with urllib.request.urlopen(req, timeout=60) as r:

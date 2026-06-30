@@ -6,23 +6,24 @@ mini-swe-agent is bash-only: its single actuator is bash commands executed
 *inside* the per-instance SWE-bench container (`docker exec`). It has no MCP
 client and no skill system, so NeoHive cannot be a host-side MCP tool (the
 HIVE-263 "Pattern 1" story). Instead retrieval is a bash command the agent runs
-in the container, which reaches the host NeoHive over MCP — the in-container
-"Pattern 2" case the HIVE-263 probe de-risked.
+in the container, which reaches the (public) NeoHive over MCP.
 
 This script IS that command. Given a natural-language query, it does a NeoHive
 MCP `memory_recall` against the instance's indexed-repo hive and prints the top
 code chunks for the agent to read. stdlib-only (the container's python is the
-repo's conda env, which may lack requests/httpx) — transport reused verbatim
-from mcp_roundtrip.py.
+repo's conda env, which may lack requests/httpx) — transport reused from
+mcp_roundtrip.py (HIVE-263).
 
 Usage (inside the container):
     python /opt/neohive/neohive_search.py "<query>" [limit]
 
-Env (forwarded into the container by run_arm_b.sh):
-    NEOHIVE_MCP_URL   e.g. http://host.docker.internal:3577/hiveminds/<project>/mcp
-    NEOHIVE_PAT       a NeoHive personal access token (pat_...)
-    NEOHIVE_HIVE      (optional) the instance's hive id; scopes recall to that
-                      hive. Omit to fan out across all hives in the project.
+Auth/env (forwarded into the container by run_arm_b.sh):
+    NEOHIVE_MCP_URL                 e.g. https://neohive.logilica.com/hiveminds/<project>/mcp
+    NEOHIVE_CF_ACCESS_CLIENT_ID     Cloudflare Access service-token id     (hosted)
+    NEOHIVE_CF_ACCESS_CLIENT_SECRET Cloudflare Access service-token secret (hosted)
+    NEOHIVE_PAT                     (optional) a NeoHive PAT, if Auth0 is ever enabled
+    NEOHIVE_HIVE                    (optional) the instance's hive id; scopes recall to
+                                    that hive. Omit to fan out across all hives.
 """
 import json
 import os
@@ -32,11 +33,28 @@ import urllib.error
 import urllib.request
 
 URL = os.environ.get("NEOHIVE_MCP_URL")
-PAT = os.environ.get("NEOHIVE_PAT")
 HIVE = os.environ.get("NEOHIVE_HIVE")  # optional hive scoping
-AUTH_HEADER = "Authorization"  # toggle to "x-api-key" if the gateway 401s
-AUTH_VALUE = f"Bearer {PAT}"   # ...and to just PAT for x-api-key
 PROTOCOL = "2025-06-18"
+
+
+def auth_headers():
+    """Build auth headers from the environment.
+
+    The hosted NeoHive sits behind Cloudflare Access (no Auth0/PAT): a CF service
+    token (CF-Access-Client-Id/Secret) gets past CF, after which NeoHive attaches
+    owner context itself. A NEOHIVE_PAT is also honored if a future deployment
+    enables Auth0.
+    """
+    h = {}
+    cf_id = os.environ.get("NEOHIVE_CF_ACCESS_CLIENT_ID")
+    cf_secret = os.environ.get("NEOHIVE_CF_ACCESS_CLIENT_SECRET")
+    if cf_id and cf_secret:
+        h["CF-Access-Client-Id"] = cf_id
+        h["CF-Access-Client-Secret"] = cf_secret
+    pat = os.environ.get("NEOHIVE_PAT")
+    if pat:
+        h["Authorization"] = f"Bearer {pat}"
+    return h
 
 
 def post(body, session_id=None):
@@ -44,7 +62,10 @@ def post(body, session_id=None):
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
-        AUTH_HEADER: AUTH_VALUE,
+        # Cloudflare's WAF blocks the default "Python-urllib/x.y" UA (Error 1010);
+        # any explicit UA passes. Required for the shim to work from the container.
+        "User-Agent": "neohive-search/0.1",
+        **auth_headers(),
     }
     if session_id:
         headers["Mcp-Session-Id"] = session_id
@@ -83,7 +104,6 @@ def extract_text(recall_resp):
         joined = "\n".join(p for p in parts if p)
         if joined:
             return joined
-    # Fallback: structuredContent or raw result.
     if isinstance(result, dict) and result.get("structuredContent"):
         return json.dumps(result["structuredContent"], indent=2)
     return json.dumps(result, indent=2)
@@ -93,14 +113,16 @@ def main():
     if len(sys.argv) < 2 or not sys.argv[1].strip():
         print('usage: neohive_search.py "<query>" [limit]', file=sys.stderr)
         return 2
-    if not URL or not PAT:
-        print("ERROR: NEOHIVE_MCP_URL and NEOHIVE_PAT must be set in the environment.", file=sys.stderr)
+    if not URL:
+        print("ERROR: NEOHIVE_MCP_URL must be set.", file=sys.stderr)
+        return 2
+    if not auth_headers():
+        print("ERROR: set NEOHIVE_CF_ACCESS_CLIENT_ID/SECRET (or NEOHIVE_PAT) for auth.", file=sys.stderr)
         return 2
 
     query = sys.argv[1]
     limit = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 8
 
-    # MCP handshake (initialize -> initialized), then memory_recall.
     _, sid = post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                    "params": {"protocolVersion": PROTOCOL, "capabilities": {},
                               "clientInfo": {"name": "neohive-search", "version": "0.1"}}})
@@ -128,8 +150,8 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except urllib.error.HTTPError as e:
-        print(f"neohive-search HTTP {e.code}: {e.reason} — check NEOHIVE_PAT/URL "
-              "(try x-api-key auth header)", file=sys.stderr)
+        print(f"neohive-search HTTP {e.code}: {e.reason} — check NEOHIVE_MCP_URL + "
+              "CF-Access service token (NEOHIVE_CF_ACCESS_CLIENT_ID/SECRET)", file=sys.stderr)
         sys.exit(1)
     except Exception as e:  # noqa: BLE001 — agent-facing tool: surface failure plainly
         print(f"neohive-search FAILED: {type(e).__name__}: {e}", file=sys.stderr)

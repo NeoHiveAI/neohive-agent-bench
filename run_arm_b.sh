@@ -12,19 +12,21 @@
 #
 # Prereqs:
 #   - .venv with mini-swe-agent + datasets (rollout) + swebench (grading).
-#   - A REACHABLE NeoHive (host-side) and a PAT. Set:
-#       NEOHIVE_BASE      host URL for the index API     (e.g. http://localhost:3577)
-#       NEOHIVE_PROJECT   the project (HiveMind) id       (UUID)
-#       NEOHIVE_PAT       a NeoHive PAT (pat_...)         (secret; never printed/committed)
-#     The container reaches NeoHive at host.docker.internal:<port> (see arm_b overlay).
+#   - A REACHABLE NeoHive + auth. For the hosted instance (Cloudflare Access), set:
+#       NEOHIVE_BASE                     e.g. https://neohive.logilica.com
+#       NEOHIVE_PROJECT                  the project id (UUID)
+#       NEOHIVE_CF_ACCESS_CLIENT_ID      CF Access service-token id     (secret)
+#       NEOHIVE_CF_ACCESS_CLIENT_SECRET  CF Access service-token secret (secret)
+#     (NeoHive has no Auth0, so no PAT — the CF token gets past Cloudflare.)
+#     The container reaches the PUBLIC host directly (no host networking needed).
 #   - Docker running (per-instance images pulled on first use).
 #   - A model API key for the chosen provider (e.g. OPENROUTER_API_KEY).
 #
 # Usage:
 #   ./run_arm_b.sh <litellm-model> [slice e.g. 0:5]
 # Example (cheap 5-instance Arm-B smoke):
-#   OPENROUTER_API_KEY=... NEOHIVE_BASE=http://localhost:3577 \
-#   NEOHIVE_PROJECT=<uuid> NEOHIVE_PAT=pat_... \
+#   OPENROUTER_API_KEY=... NEOHIVE_BASE=https://neohive.logilica.com \
+#   NEOHIVE_PROJECT=<uuid> \
 #   ./run_arm_b.sh openrouter/z-ai/glm-5.2 0:5
 set -euo pipefail
 export MSWEA_COST_TRACKING="${MSWEA_COST_TRACKING:-ignore_errors}"  # see run_swebench.sh
@@ -34,17 +36,15 @@ VENV="$HERE/.venv/bin"
 MODEL="${1:?usage: run_arm_b.sh <litellm-model> [slice e.g. 0:5]}"
 SLICE="${2:-}"
 
-: "${NEOHIVE_BASE:?set NEOHIVE_BASE (host URL, e.g. http://localhost:3577)}"
-: "${NEOHIVE_PROJECT:?set NEOHIVE_PROJECT (project/HiveMind id)}"
-: "${NEOHIVE_PAT:?set NEOHIVE_PAT (a NeoHive PAT; never printed)}"
+: "${NEOHIVE_BASE:?set NEOHIVE_BASE (e.g. https://neohive.logilica.com)}"
+: "${NEOHIVE_PROJECT:?set NEOHIVE_PROJECT (project id)}"
+: "${NEOHIVE_CF_ACCESS_CLIENT_ID:?set NEOHIVE_CF_ACCESS_CLIENT_ID (CF Access service token; never printed)}"
+: "${NEOHIVE_CF_ACCESS_CLIENT_SECRET:?set NEOHIVE_CF_ACCESS_CLIENT_SECRET (CF Access service token; never printed)}"
 
-# Container-side MCP URL: the shim runs INSIDE the container and reaches the host
-# NeoHive via host.docker.internal. Derive host:port from NEOHIVE_BASE.
-PORT="$(printf '%s' "$NEOHIVE_BASE" | sed -E 's#^https?://[^:/]+:?([0-9]*).*#\1#')"
-PORT="${PORT:-3577}"
-SCHEME="$(printf '%s' "$NEOHIVE_BASE" | sed -E 's#^(https?)://.*#\1#')"
-export NEOHIVE_MCP_URL="${SCHEME}://host.docker.internal:${PORT}/hiveminds/${NEOHIVE_PROJECT}/mcp"
-export NEOHIVE_PAT
+# The shim runs inside the container and reaches the public NeoHive directly.
+# MCP route is /projects/:id/mcp (NOT /hiveminds/:id/mcp on this deployment).
+export NEOHIVE_MCP_URL="${NEOHIVE_BASE%/}/projects/${NEOHIVE_PROJECT}/mcp"
+export NEOHIVE_CF_ACCESS_CLIENT_ID NEOHIVE_CF_ACCESS_CLIENT_SECRET
 
 SLUG="$(printf '%s' "$MODEL" | tr '/:.' '___')"
 STAMP="$(date +%Y%m%d-%H%M%S)"

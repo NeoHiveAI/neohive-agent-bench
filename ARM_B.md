@@ -67,36 +67,59 @@ config for the whole batch, so per-instance hive scoping forces a one-instance-p
 invocation loop (`--filter "^<id>$"`). All runs merge into one `preds.json`
 (`update_preds_file` keys by instance_id), so grading is unchanged.
 
-## Open items — verify on first live run (needs a reachable NeoHive)
+## Target: hosted `neohive.logilica.com` (Cloudflare Access, no Auth0/PAT)
 
-These are the knobs that can only be nailed against a live instance (exactly what
-HIVE-263 flagged):
+Decided 2026-06-30: index into + search the hosted instance. Auth facts learned
+on first contact:
+- **No Auth0 → no NeoHive PAT.** Access is gated by **Cloudflare Access**; send the
+  CF service-token headers `CF-Access-Client-Id` / `CF-Access-Client-Secret`
+  (from `~/.zshrc`: `NEOHIVE_CF_ACCESS_CLIENT_ID` / `NEOHIVE_CF_ACCESS_CLIENT_SECRET`).
+  Past CF, NeoHive attaches owner context itself.
+- **MCP route is `/projects/:id/mcp`** on this deployment (NOT `/hiveminds/:id/mcp`).
+- **REST is `/api/hives` + `X-HiveMind-Id: <project>` header** (gateway-level).
+- **CF WAF Error 1010 gotcha:** Cloudflare blocks the default `Python-urllib/x.y`
+  User-Agent. The shim + indexer set an explicit `User-Agent` (any non-default UA
+  passes). Without it every request 403s — and the in-container shim hits this too.
+- The container reaches the **public** host directly (normal egress in the agent
+  phase) — no `host.docker.internal`, no `--add-host`.
 
-1. **Target NeoHive + creds (BLOCKER).** No local NeoHive is running, and the dev
-   box moved to a hosted `https://neohive.logilica.com`. Arm B needs `NEOHIVE_BASE`
-   + `NEOHIVE_PROJECT` + a `NEOHIVE_PAT`. Recommended: stand up a dedicated local
-   NeoHive for the bench (isolated, reproducible, container reaches it via
-   host.docker.internal, no rate limits).
-2. **`file://` clone.** Confirm NeoHive's `cloneRepo` accepts a `file://` URL +
-   arbitrary branch. If it rejects non-GitHub URLs, fall back to the `clone_path`
-   field or push `swebench-base` to a throwaway remote.
-3. **Container → host networking on Colima.** Confirm `--add-host=host.docker.internal:host-gateway`
-   actually resolves to the macOS host (where NeoHive runs) from inside the
-   emulated container. Run `mcp_reachability_probe.sh` first to flip HIVE-263 green.
-4. **Auth header.** `Authorization: Bearer pat_…` assumed; if the gateway 401s,
-   switch the shim + indexer to `x-api-key` (one-line toggle).
-5. **In-container python.** The shim is invoked as `python /opt/neohive/neohive_search.py`;
-   confirm the testbed conda `python` is on PATH under `bash -c` (BASH_ENV sources
-   the image's `.bashrc` → `conda activate testbed`).
-6. **Embedding model.** `repo` hives default to the server's repo model; decide
-   whether to pin a code-specific model via `NEOHIVE_EMBEDDING_MODEL` for fairness.
+## Status
+
+- ✅ **Shim (HIVE-265) validated end-to-end** against the hosted NeoHive through CF
+  (`initialize` → `memory_recall` returns results, ~0.5 s).
+- ✅ **Contamination guard (HIVE-268) validated offline** (psf__requests-1142, + a
+  negative test).
+- ⛔ **Indexing ingestion (HIVE-268) BLOCKED on hosted.** The `file://` local-mirror
+  trick assumed a co-located NeoHive; the hosted server cannot reach a `file://`
+  path on this laptop. And NeoHive's sync `cloneRepo` does
+  `git clone --branch <branch> --single-branch --depth 1` — it needs a remote
+  **ref** (branch/tag), not a SHA, so it can neither pin `base_commit` from the
+  public repo nor accept a local mirror. (Code-via-`/uploads` is capped at 20
+  files/batch + uses the markdown path, so it is not a viable whole-repo route.)
+
+  Resolving this is a fork (pending decision):
+  - **A — add commit-pinning to NeoHive sync** (clone full + `git checkout <commit>`,
+    new `commit`/`ref` field on sync-config). Clean, general, dogfoods NeoHive;
+    needs a MemVec PR + redeploy of the hosted instance.
+  - **B — push synthetic `swebench-<id>` branches to a throwaway remote** NeoHive can
+    clone (e.g. a private logilica GitHub repo). No server change; per-instance
+    push overhead + cleanup.
+
+## Other open items
+
+- **In-container python.** The shim is invoked as `python /opt/neohive/neohive_search.py`;
+  confirm the testbed conda `python` is on PATH under `bash -c` (BASH_ENV sources
+  the image's `.bashrc` → `conda activate testbed`).
+- **Embedding model.** `repo` hives default to `nomic-embed-text-v2-moe`; decide
+  whether to pin a code-specific model via `NEOHIVE_EMBEDDING_MODEL` for fairness.
 
 ## Run
 
 ```sh
-# 5-instance Arm-B smoke (needs a reachable NeoHive + PAT + a model key):
-OPENROUTER_API_KEY=... NEOHIVE_BASE=http://localhost:3577 \
-NEOHIVE_PROJECT=<uuid> NEOHIVE_PAT=pat_... \
+# 5-instance Arm-B smoke (CF creds come from ~/.zshrc; needs a model key + the
+# indexing fork resolved). NeoHive has no Auth0, so no PAT — CF token only:
+OPENROUTER_API_KEY=... NEOHIVE_BASE=https://neohive.logilica.com \
+NEOHIVE_PROJECT=<uuid> \
 ./run_arm_b.sh openrouter/z-ai/glm-5.2 0:5
 
 # then grade exactly like Arm A:

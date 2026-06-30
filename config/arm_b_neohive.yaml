@@ -4,12 +4,15 @@
 # It is recursively merged ON TOP of the stock swebench.yaml, so Arm B differs
 # from Arm A by EXACTLY these keys — and nothing else:
 #
-#   1. environment.run_args   — host networking + bind-mount the neohive-search
-#                               shim into the container (the stock runner injects
-#                               no run_args, so Arm A uses the default ["--rm"]).
-#   2. environment.forward_env — forward the NeoHive endpoint + PAT (+ per-instance
-#                               hive id) from the host into the container, so the
-#                               shim can reach NeoHive without baking secrets here.
+#   1. environment.run_args   — bind-mount the neohive-search shim into the
+#                               container (the stock runner injects no run_args,
+#                               so Arm A uses the default ["--rm"]). NeoHive is a
+#                               PUBLIC host (neohive.logilica.com), so the container
+#                               reaches it via normal egress — no host networking.
+#   2. environment.forward_env — forward the NeoHive MCP URL + Cloudflare Access
+#                               service token (+ per-instance hive id) into the
+#                               container, so the shim can reach NeoHive through CF
+#                               without baking secrets here.
 #   3. agent.system_template  — tell the agent the `neohive-search` command exists
 #                               and to prefer it for code navigation.
 #
@@ -40,9 +43,9 @@ agent:
     does not replace them.
 
 environment:
-  # --rm matches the stock default; the rest is the NeoHive delta.
-  # --add-host lets the in-container shim reach the host's NeoHive gateway.
-  # The shim dir is mounted read-only at /opt/neohive.
-  run_args: ["--rm", "--add-host=host.docker.internal:host-gateway", "-v", "__SHIM_DIR__:/opt/neohive:ro"]
-  # Forwarded only if set in the host env (run_arm_b.sh sets all three per instance).
-  forward_env: ["NEOHIVE_MCP_URL", "NEOHIVE_PAT", "NEOHIVE_HIVE"]
+  # --rm matches the stock default; the shim mount is the only docker delta.
+  # NeoHive is public (CF-protected), so no host networking is needed.
+  run_args: ["--rm", "-v", "__SHIM_DIR__:/opt/neohive:ro"]
+  # Forwarded only if set in the host env (run_arm_b.sh sets these per instance).
+  # CF service token gets past Cloudflare Access; NeoHive itself needs no PAT.
+  forward_env: ["NEOHIVE_MCP_URL", "NEOHIVE_CF_ACCESS_CLIENT_ID", "NEOHIVE_CF_ACCESS_CLIENT_SECRET", "NEOHIVE_HIVE"]

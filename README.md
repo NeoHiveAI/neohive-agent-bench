@@ -21,6 +21,7 @@ SWE-bench Verified. Linear project: **Agent Benchmarking** (HIVE).
 | `mcp_reachability_probe.sh` + `mcp_roundtrip.py` | HIVE-263 | Runnable `memory_store→recall` probe |
 | `run_swebench.sh` | HIVE-264 | Run the harness on the pilot subset (Arm A control) |
 | `pilot_filter.py` | HIVE-264 | Emit the `--filter` regex matching exactly the pinned 30 |
+| `grade_swebench.sh` | HIVE-264 | Grade a run's `preds.json` against the hidden tests (resolved/unresolved) |
 
 ## Scaffold: mini-swe-agent
 We use **mini-swe-agent** (the SWE-bench team's ~100-LOC, bash-only agent) as the
@@ -31,7 +32,8 @@ and its minimalism keeps the A/B delta clean. See HIVE-264 for the rationale.
 ## Setup
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install mini-swe-agent datasets
+.venv/bin/pip install mini-swe-agent datasets   # rollout (run_swebench.sh)
+.venv/bin/pip install swebench                  # grading  (grade_swebench.sh)
 ```
 
 ## Run the pilot (HIVE-264)
@@ -55,6 +57,26 @@ list before pinning in HIVE-266:
 images are pulled on first use; multi-GB). The dataset+filter selection is
 validated (it resolves to exactly the pinned 30); the model call + Docker run is
 the only remaining step.
+
+## Grade the patches (HIVE-264)
+A run produces `preds.json` (`{instance_id, model_name_or_path, model_patch}`).
+`grade_swebench.sh` scores those patches against SWE-bench's hidden tests inside
+the sealed per-instance container and emits a resolved/unresolved verdict.
+
+```sh
+./grade_swebench.sh results/arma-<model>-<stamp>/preds.json glm52-armA-smoke 2
+# report -> results/<model>.<run_id>.json  (resolved_ids / unresolved_ids)
+```
+
+Notes:
+- **Colima / non-default Docker daemon:** the `swebench` harness uses the Python
+  docker SDK (`docker.from_env()`), which reads `DOCKER_HOST` and ignores the
+  docker CLI's active *context*. The script auto-exports `DOCKER_HOST` from the
+  active context so it Just Works; without it the harness dies with
+  "Error while fetching server API version: FileNotFoundError".
+- **Apple Silicon:** SWE-bench ships only x86_64 instance images, so they run
+  under emulation (correct, slower). For the full sweep, prefer a native x86_64
+  host (see HIVE-264 / HIVE-176).
 
 ## Other utilities
 ```sh

@@ -3,6 +3,7 @@ __pycache__/
 .DS_Store
 .venv/
 results/
+logs/
 .env
 *.env
 

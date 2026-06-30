@@ -169,6 +169,20 @@ def _neohive_req(method: str, path: str, body: dict | None = None) -> dict:
 
 def index_into_neohive(instance_id: str, repo: str, https_url: str, branch: str, base_commit: str,
                        poll_timeout: int) -> str:
+    # Idempotent: if a repo hive named for this instance is already indexed at this
+    # base_commit, reuse it (no re-index/churn). Hives accumulate in the project —
+    # one repo@commit per hive — which is the intended multi-repo NeoHive usage.
+    hives = _neohive_req("GET", "/api/hives")
+    existing = next((h for h in hives.get("items", []) if h.get("name") == instance_id and h.get("type") == "repo"), None)
+    if existing:
+        hid = existing["id"]
+        cfgs = _neohive_req("GET", f"/api/hives/{hid}/sync-configs").get("items", [])
+        if any(c.get("last_indexed_sha") == base_commit for c in cfgs):
+            print(f"[index] reusing hive {hid} (already indexed at {base_commit[:12]})")
+            return hid
+        _neohive_req("DELETE", f"/api/hives/{hid}")  # exists but stale -> recreate
+        print(f"[index] deleted stale hive {hid} (not at base_commit); recreating")
+
     hive = _neohive_req("POST", "/api/hives", {
         "name": instance_id,
         "type": "repo",

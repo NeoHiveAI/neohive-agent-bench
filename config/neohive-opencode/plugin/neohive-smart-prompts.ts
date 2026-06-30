@@ -29,7 +29,10 @@
 
 import type { Plugin } from "@opencode-ai/plugin"
 
-const HIVE = ""  // cross-hive; the per-instance project holds exactly one hive
+// Scope auto-recall to the routed hive (NEOHIVE_HIVE) when set, so a project that
+// holds several repos' hives can't leak another instance's code into this solve.
+// Empty = cross-hive RRF (the default multi-repo behavior).
+const HIVE = process.env.NEOHIVE_HIVE || ""
 const MODEL = (process.env.NEOHIVE_SMART_MODEL || "openrouter/z-ai/glm-4.6").replace(/^openrouter\//, "")
 const TRIGGER = "min_len"
 const DISABLE_FLAG = "NEOHIVE_SMART_DISABLED"

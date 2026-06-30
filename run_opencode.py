@@ -74,24 +74,58 @@ def project_hives() -> list[dict]:
     return res.get("items", res if isinstance(res, list) else [])
 
 
-def purge_project_hives() -> None:
-    # Only repo hives break per-instance isolation (other instances' indexed code).
-    # The auto-managed "knowledge" hive is immutable (DELETE -> 403) and project-level,
-    # so leave it. (Cross-instance leakage via stored learnings in Knowledge is a
-    # separate concern tracked for the full sweep.)
+def write_routing(cfgdir: Path, repo: str, base_commit: str, hive_id: str) -> None:
+    """Generate the NeoHive HIVE-routing table (the generate-agents-md "topology
+    block" idea) and register it as an opencode instruction. Multiple repos coexist
+    in one project (real NeoHive usage); this tells the agent which hive holds
+    /testbed's repo and to scope recall to it — routing + the contamination guard in
+    one. No per-run hive teardown."""
+    rows = []
     for h in project_hives():
         if h.get("type") != "repo":
             continue
-        idx._neohive_req("DELETE", f"/api/hives/{h['id']}")
-        print(f"[armb] purged stale repo hive {h['id']} ({h.get('name')})")
+        nm = h.get("name", "")
+        mark = "  ← THIS repo (/testbed)" if h.get("id") == hive_id else ""
+        rows.append(f"| `{h.get('id')}` | {nm} |{mark} |")
+    table = "\n".join(rows) if rows else "| (none) | | |"
+    routing = f"""# NeoHive hive routing (this project)
+
+This NeoHive project indexes one repository per hive, each pinned at a fixed commit.
+The repository in your working directory (`/testbed`) is **{repo} @ {base_commit}**,
+indexed in hive **`{hive_id}`**.
+
+When you call the NeoHive `memory_recall` / `memory_context` MCP tools, ALWAYS pass
+`hive: "{hive_id}"` so results come only from this repository's index (other hives in
+this project hold unrelated repos / commits).
+
+| hive id | name (instance) | |
+|---|---|---|
+{table}
+"""
+    (cfgdir / "instructions").mkdir(exist_ok=True)
+    (cfgdir / "instructions" / "neohive-routing.md").write_text(routing)
+    ocj = cfgdir / "opencode.json"
+    cfg = json.loads(ocj.read_text())
+    instr = cfg.setdefault("instructions", [])
+    if "instructions/neohive-routing.md" not in instr:
+        instr.append("instructions/neohive-routing.md")
+    ocj.write_text(json.dumps(cfg, indent=2))
 
 
-def delete_hive(hive_id: str) -> None:
-    try:
-        idx._neohive_req("DELETE", f"/api/hives/{hive_id}")
-        print(f"[armb] deleted hive {hive_id}")
-    except Exception as e:  # noqa: BLE001 — cleanup best-effort
-        print(f"[armb] WARN: could not delete hive {hive_id}: {e}", file=sys.stderr)
+NEOHIVE_TOOLS = ["neohive_memory_recall", "neohive_memory_context", "neohive_memory_store",
+                 "neohive_list_hives", "neohive_memory_stats"]
+
+
+def parse_usage(events_text: str) -> dict:
+    """Best-effort NeoHive-usage counts from opencode --format json events + logs.
+    Counts are raw occurrences of each tool name (approximate — a call emits several
+    events) plus the smart-prompts injection marker; the point is to PROVE usage."""
+    import re
+    usage = {t: len(re.findall(re.escape(f'"{t}"'), events_text)) for t in NEOHIVE_TOOLS}
+    usage["explore_neohive_dispatch"] = len(re.findall("explore-neohive", events_text))
+    usage["smart_context_injections"] = events_text.count("NeoHive smart context")
+    usage["used_neohive"] = any(v for k, v in usage.items() if k != "used_neohive")
+    return usage
 
 
 def index_instance(instance_id: str) -> str:
@@ -129,17 +163,19 @@ def build_config_dir(arm: str, project: str | None) -> Path:
 
 
 def run_instance(instance_id: str, arm: str, model: str, ocbin: str, out_dir: Path,
-                 timeout: int, project: str | None, keep_hive: bool) -> None:
+                 timeout: int, project: str | None) -> None:
     inst = idx.load_instance(instance_id)
     image = image_for(instance_id)
+    inst_dir = out_dir / instance_id
+    inst_dir.mkdir(parents=True, exist_ok=True)
     hive_id = None
 
-    if arm == "b":
-        purge_project_hives()                 # ensure recall can't fan to other instances
-        hive_id = index_instance(instance_id)  # index repo@base_commit, code embeddings
-
     cfgdir = build_config_dir(arm, project)
-    print(f"[run] arm={arm} {instance_id} model={model} image={image}")
+    if arm == "b":
+        hive_id = index_instance(instance_id)  # idempotent; hives persist (multi-repo project)
+        write_routing(cfgdir, inst["repo"], inst["base_commit"], hive_id)
+
+    print(f"[run] arm={arm} {instance_id} model={model} image={image}" + (f" hive={hive_id}" if hive_id else ""))
     cid = docker("run", "-d", "--rm", "-v", f"{ocbin}:/opt/oc/opencode:ro",
                  image, "sleep", str(timeout + 600)).stdout.strip()
     try:
@@ -150,27 +186,38 @@ def run_instance(instance_id: str, arm: str, model: str, ocbin: str, out_dir: Pa
 
         env_flags = ["-e", "OPENROUTER_API_KEY"]
         if arm == "b":
-            env_flags += ["-e", "NEOHIVE_CF_ACCESS_CLIENT_ID", "-e", "NEOHIVE_CF_ACCESS_CLIENT_SECRET"]
+            env_flags += ["-e", "NEOHIVE_CF_ACCESS_CLIENT_ID", "-e", "NEOHIVE_CF_ACCESS_CLIENT_SECRET",
+                          "-e", f"NEOHIVE_HIVE={hive_id}"]  # scope recall + smart-prompts to this hive
         task = TASK_TEMPLATE.format(problem_statement=inst["problem_statement"])
+        # --format json => raw event stream (tool calls etc.) for usage telemetry;
+        # --print-logs => plugin activity (smart-prompts, grep-nudge) on stderr.
         try:
             r = docker("exec", *env_flags, "-w", "/testbed", cid,
-                       "/opt/oc/opencode", "run", "-m", model, task,
+                       "/opt/oc/opencode", "run", "--format", "json", "--print-logs", "-m", model, task,
                        timeout=timeout, check=False)
-            sys.stderr.write((r.stdout or "")[-3000:])
+            events, errlog = r.stdout or "", r.stderr or ""
             status = "ok" if r.returncode == 0 else f"exit{r.returncode}"
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
+            dec = lambda b: b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
+            events, errlog = dec(e.stdout), dec(e.stderr)
             status = "timeout"
-            print(f"[run] {instance_id} hit the {timeout}s budget", file=sys.stderr)
+        (inst_dir / "opencode-events.json").write_text(events)
+        (inst_dir / "opencode-stderr.log").write_text(errlog)
 
         diff = docker("exec", "-w", "/testbed", cid, "git", "diff").stdout
-        (out_dir / instance_id).mkdir(parents=True, exist_ok=True)
-        (out_dir / instance_id / "patch.diff").write_text(diff)
+        (inst_dir / "patch.diff").write_text(diff)
         update_preds(out_dir / "preds.json", instance_id, model, diff)
-        print(f"[run] {instance_id} arm={arm} status={status} patch_len={len(diff)}")
+
+        usage_str = ""
+        if arm == "b":
+            usage = parse_usage(events + "\n" + errlog)
+            (inst_dir / "usage.json").write_text(json.dumps(usage, indent=2))
+            usage_str = (f" neohive_used={usage['used_neohive']}"
+                         f" recall~{usage['neohive_memory_recall']} smartctx={usage['smart_context_injections']}")
+        print(f"[run] {instance_id} arm={arm} status={status} patch_len={len(diff)}{usage_str}")
     finally:
         docker("rm", "-f", cid, check=False)
-        if arm == "b" and hive_id and not keep_hive:
-            delete_hive(hive_id)
+    # No hive teardown: hives persist for reuse (idempotent index) + the multi-repo project.
 
 
 def update_preds(path: Path, instance_id: str, model: str, patch: str) -> None:
@@ -186,7 +233,6 @@ def main() -> int:
     ap.add_argument("--model", required=True, help="e.g. openrouter/z-ai/glm-4.6")
     ap.add_argument("--timeout", type=int, default=1200, help="per-instance opencode wall-clock budget (s)")
     ap.add_argument("--output", default="")
-    ap.add_argument("--keep-hive", action="store_true", help="Arm B: don't delete the hive after the run")
     args = ap.parse_args()
 
     if not os.environ.get("OPENROUTER_API_KEY"):
@@ -201,7 +247,7 @@ def main() -> int:
 
     for iid in args.instance_ids:
         try:
-            run_instance(iid, args.arm, args.model, ocbin, out_dir, args.timeout, project, args.keep_hive)
+            run_instance(iid, args.arm, args.model, ocbin, out_dir, args.timeout, project)
         except Exception as e:  # noqa: BLE001 — keep going across instances
             print(f"[run] ERROR on {iid}: {e}", file=sys.stderr)
 

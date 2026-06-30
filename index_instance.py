@@ -2,29 +2,34 @@
 """
 HIVE-268 — Index one SWE-bench instance's repo @ base_commit into NeoHive (Arm B).
 
-The contamination guard is *structural*, not a filter: both the gold `patch`
-(the fix) and the `test_patch` (the tests that check the fix) are diffs applied
-ON TOP of `base_commit` — the fix at agent time, the tests at grade time. So the
-pristine `base_commit` tree contains neither. We therefore index the repo exactly
-at `base_commit` and assert that neither patch is already present.
+Validated end-to-end against the hosted NeoHive (neohive.logilica.com) on
+2026-06-30 for psf__requests-1142.
 
-NeoHive's git sync indexes a *branch tip*, not an arbitrary commit
-(server `services/sync/index.ts` -> `cloneRepo(repoUrl, branch)`). To pin
-`base_commit` we make a local clone, create a synthetic branch `swebench-base`
-pointing at `base_commit`, and point a NeoHive sync-config at that local repo
-(`file://...`, branch `swebench-base`). This reuses NeoHive's real code-embedding
-path (the whole point of Arm B) without any GitHub remote or credentials.
+Contamination guard is STRUCTURAL: both the gold `patch` (the fix) and the
+`test_patch` (the tests that check it) are diffs applied ON TOP of base_commit, so
+the pristine base_commit tree contains neither. We index exactly at base_commit and
+assert each patch applies forward (we are pre-fix) but not in reverse (answer absent).
 
-Pipeline:
+NeoHive's git sync indexes a remote BRANCH tip (`cloneRepo(url, branch)` does
+`git clone --branch <ref> --depth 1`), and the hosted server can't reach a local
+`file://` mirror. So we publish a public mirror under NeoHiveAI with a branch
+`swebench/<instance_id>` pinned at base_commit, and point NeoHive at it. The mirror
+doubles as the open-source TRANSPARENCY artifact: the bench repo embeds it as a
+submodule pinned at base_commit, and anyone can verify the branch SHA == the
+dataset's base_commit (git content-addressing does the rest).
+
+Pipeline (per instance):
   1. Load the instance row (repo, base_commit, patch, test_patch) from the dataset.
-  2. Clone repo, checkout base_commit, create branch `swebench-base`.
-  3. CONTAMINATION GUARD: assert the gold patch + test_patch APPLY forward
-     (we are pre-fix) and do NOT apply in reverse (the answer is absent). Abort otherwise.
-  4. NeoHive: create a per-instance `repo` hive, create+trigger a sync-config
-     pointed at the local mirror, poll until indexed. Print the hive id.
+  2. Clone/refresh a per-upstream cache; create branch swebench/<id> at base_commit.
+  3. CONTAMINATION GUARD (no NeoHive needed).
+  4. Publish: ensure the NeoHiveAI/swebench-mirror-<repo> mirror exists; push the branch.
+  5. NeoHive: create a per-instance code-embedding `repo` hive; create+trigger a
+     sync-config pointed at the mirror branch; poll until indexed. Print the hive id.
 
-Deterministic steps 1-3 need no NeoHive and are validated by `--guard-only`.
-Step 4 needs a reachable NeoHive (NEOHIVE_BASE + NEOHIVE_PROJECT + NEOHIVE_PAT).
+Auth (hosted): Cloudflare Access service token + project id. Set:
+  NEOHIVE_BASE (default https://neohive.logilica.com), NEOHIVE_PROJECT,
+  NEOHIVE_CF_ACCESS_CLIENT_ID, NEOHIVE_CF_ACCESS_CLIENT_SECRET.
+GitHub: pushes via the `github-work` SSH alias; repo create/exists via `gh`.
 """
 from __future__ import annotations
 
@@ -40,21 +45,23 @@ from pathlib import Path
 
 DATASET = "princeton-nlp/SWE-Bench_Verified"
 SPLIT = "test"
-SYNTH_BRANCH = "swebench-base"
-
-# Defense-in-depth: even though base_commit structurally excludes the answer,
-# blocklist test dirs so retrieval can't surface pre-existing tests that hint at
-# expected behaviour. The structural guard is the real guarantee; this is belt.
+MIRROR_ORG = "NeoHiveAI"
+SSH_HOST = "github-work"  # ~/.ssh/config alias for the logilica GitHub account
+SYNTH_BRANCH_PREFIX = "swebench"
+# Code-specialized embedding that fits the dev box (the 3584d nomic-embed-code
+# variants "Won't fit"). Pinning a code model is what makes Arm B retrieve source
+# instead of docs — see Knowledge memory #302.
+DEFAULT_EMBEDDING_MODEL = os.environ.get("NEOHIVE_EMBEDDING_MODEL", "google/embeddinggemma-300m-code")
+# Defense-in-depth on top of the structural guard.
 DEFAULT_TEST_BLOCKLIST = ["**/test/**", "**/tests/**", "**/testing/**", "**/*_test.py", "**/test_*.py"]
 
 
-def run(cmd: list[str], cwd: str | None = None, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
+def run(cmd: list[str], cwd: str | None = None, check: bool = True, input_text: str | None = None):
+    return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True, input=input_text)
 
 
 def load_instance(instance_id: str) -> dict:
-    """Load one instance's full row (incl. patch + test_patch) from the dataset."""
-    from datasets import load_dataset  # heavy; host-side only, never in-container
+    from datasets import load_dataset  # heavy; host-side only
 
     ds = load_dataset(DATASET, split=SPLIT)
     rows = ds.filter(lambda r: r["instance_id"] == instance_id)
@@ -63,60 +70,82 @@ def load_instance(instance_id: str) -> dict:
     return rows[0]
 
 
-def clone_at_base(repo: str, base_commit: str, dest: Path, blobless: bool) -> None:
+def mirror_name(repo: str) -> str:
+    return f"swebench-mirror-{repo.split('/')[1]}"
+
+
+def ensure_repo_cache(repo: str, base_commit: str, cache: Path) -> Path:
+    """Full clone of the upstream repo (cached per upstream; needed to push), with
+    base_commit present. A full clone is required because GitHub rejects shallow
+    pushes; subsequent instances of the same repo reuse the cache and just add a branch."""
     url = f"https://github.com/{repo}.git"
-    if dest.exists():
-        run(["rm", "-rf", str(dest)])
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    args = ["git", "clone", "--no-single-branch"]
-    if blobless:
-        args += ["--filter=blob:none"]
-    args += [url, str(dest)]
-    print(f"[index] cloning {url} ({'blobless' if blobless else 'full'}) ...")
-    run(args)
-    run(["git", "-C", str(dest), "checkout", "--quiet", base_commit])
-    run(["git", "-C", str(dest), "checkout", "--quiet", "-B", SYNTH_BRANCH])
-    head = run(["git", "-C", str(dest), "rev-parse", "HEAD"]).stdout.strip()
-    assert head == base_commit, f"HEAD {head} != base_commit {base_commit}"
-    print(f"[index] {repo} @ {base_commit[:12]} on branch {SYNTH_BRANCH}")
+    if not (cache / ".git").exists():
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        if cache.exists():
+            run(["rm", "-rf", str(cache)])
+        print(f"[index] full-cloning {url} (cached per upstream) ...")
+        run(["git", "clone", url, str(cache)])
+    # Make sure base_commit is present (fetch by SHA if an older cache lacks it).
+    if run(["git", "-C", str(cache), "cat-file", "-e", base_commit], check=False).returncode != 0:
+        run(["git", "-C", str(cache), "fetch", "origin", base_commit], check=False)
+    return cache
 
 
-def _applies(repo_dir: Path, patch_text: str, reverse: bool) -> bool:
-    """True if `git apply --check [--reverse]` succeeds for patch_text."""
+def make_branch(cache: Path, instance_id: str, base_commit: str) -> str:
+    branch = f"{SYNTH_BRANCH_PREFIX}/{instance_id}"
+    run(["git", "-C", str(cache), "branch", "-f", branch, base_commit])
+    head = run(["git", "-C", str(cache), "rev-parse", branch]).stdout.strip()
+    assert head == base_commit, f"branch {branch} at {head} != base_commit {base_commit}"
+    return branch
+
+
+def _applies(cache: Path, patch_text: str, reverse: bool) -> bool:
     if not patch_text.strip():
         return False
-    args = ["git", "-C", str(repo_dir), "apply", "--check"]
-    if reverse:
-        args.append("--reverse")
-    args.append("-")
-    p = subprocess.run(args, input=patch_text, text=True, capture_output=True)
-    return p.returncode == 0
+    args = ["git", "-C", str(cache), "apply", "--check"] + (["--reverse"] if reverse else []) + ["-"]
+    return subprocess.run(args, input=patch_text, text=True, capture_output=True).returncode == 0
 
 
-def contamination_guard(repo_dir: Path, gold_patch: str, test_patch: str) -> None:
-    """Assert base_commit is pre-fix: each patch applies forward, not in reverse."""
+def contamination_guard(cache: Path, instance_id: str, base_commit: str, gold: str, test: str) -> None:
+    # Check against the base_commit tree (worktree may be on another branch; use the index-free apply at that tree).
+    run(["git", "-C", str(cache), "checkout", "--quiet", base_commit])
     failures = []
-    for label, patch in [("gold patch", gold_patch), ("test_patch", test_patch)]:
-        fwd = _applies(repo_dir, patch, reverse=False)
-        rev = _applies(repo_dir, patch, reverse=True)
-        # Pre-fix state: the diff can be applied (fwd) and is not already present (not rev).
+    for label, patch in [("gold patch", gold), ("test_patch", test)]:
+        fwd, rev = _applies(cache, patch, False), _applies(cache, patch, True)
         ok = fwd and not rev
-        status = "OK" if ok else "CONTAMINATED"
-        print(f"[guard] {label:11} applies_forward={fwd} already_present={rev} -> {status}")
+        print(f"[guard] {label:11} applies_forward={fwd} already_present={rev} -> {'OK' if ok else 'CONTAMINATED'}")
         if not ok:
             failures.append(f"{label} (forward={fwd}, reverse={rev})")
     if failures:
-        raise SystemExit(
-            "[guard] CONTAMINATION GUARD FAILED — the indexed tree is not the clean "
-            f"pre-fix base_commit state: {', '.join(failures)}"
-        )
+        raise SystemExit(f"[guard] CONTAMINATION GUARD FAILED for {instance_id}: {', '.join(failures)}")
     print("[guard] PASS — base_commit tree contains neither the fix nor its tests.")
 
 
-# ---- NeoHive ingestion (needs a reachable NeoHive). Verify headers/file:// on first live run. ----
+def ensure_mirror(repo: str) -> tuple[str, str]:
+    """Ensure the public mirror repo exists under NeoHiveAI. Returns (ssh_url, https_url)."""
+    name = mirror_name(repo)
+    full = f"{MIRROR_ORG}/{name}"
+    if run(["gh", "repo", "view", full], check=False).returncode != 0:
+        print(f"[index] creating public mirror {full} ...")
+        run(["gh", "repo", "create", full, "--public",
+             "--description", f"SWE-bench Arm-B mirror of {repo}. Branch swebench/<instance_id> = the "
+             f"repo at that instance's base_commit (pre-fix) — the exact tree indexed into NeoHive. "
+             f"Verify the branch SHA equals the dataset base_commit."])
+    return f"git@{SSH_HOST}:{full}.git", f"https://github.com/{full}.git"
+
+
+def publish_branch(cache: Path, ssh_url: str, branch: str) -> None:
+    print(f"[index] pushing {branch} -> {ssh_url}")
+    run(["git", "-C", str(cache), "push", ssh_url, branch])
+    remote = run(["git", "-C", str(cache), "ls-remote", ssh_url, f"refs/heads/{branch}"]).stdout.strip()
+    assert remote, f"branch {branch} not found on mirror after push"
+    print(f"[index] mirror ref: {remote.split()[0][:12]}")
+
+
+# ---- NeoHive ingestion (hosted; Cloudflare Access) ----
 
 def _neohive_req(method: str, path: str, body: dict | None = None) -> dict:
-    base = os.environ["NEOHIVE_BASE"].rstrip("/")
+    base = os.environ.get("NEOHIVE_BASE", "https://neohive.logilica.com").rstrip("/")
     project = os.environ["NEOHIVE_PROJECT"]
     headers = {
         "Content-Type": "application/json",
@@ -124,8 +153,6 @@ def _neohive_req(method: str, path: str, body: dict | None = None) -> dict:
         # CF WAF blocks the default Python-urllib UA (Error 1010); any UA passes.
         "User-Agent": "neohive-agent-bench/0.1",
     }
-    # Hosted NeoHive sits behind Cloudflare Access (no Auth0/PAT); the CF service
-    # token gets past CF, after which NeoHive attaches owner context itself.
     cf_id = os.environ.get("NEOHIVE_CF_ACCESS_CLIENT_ID")
     cf_secret = os.environ.get("NEOHIVE_CF_ACCESS_CLIENT_SECRET")
     if cf_id and cf_secret:
@@ -140,61 +167,65 @@ def _neohive_req(method: str, path: str, body: dict | None = None) -> dict:
     return json.loads(raw) if raw.strip() else {}
 
 
-def index_into_neohive(instance_id: str, repo: str, mirror: Path, poll_timeout: int) -> str:
-    embedding_model = os.environ.get("NEOHIVE_EMBEDDING_MODEL")  # None -> server's repo default
+def index_into_neohive(instance_id: str, repo: str, https_url: str, branch: str, base_commit: str,
+                       poll_timeout: int) -> str:
     hive = _neohive_req("POST", "/api/hives", {
-        "name": f"swebench-{instance_id}",
+        "name": instance_id,
         "type": "repo",
-        **({"embedding_model": embedding_model} if embedding_model else {}),
-        "description": f"SWE-bench Arm B: {repo} @ base_commit (instance {instance_id})",
+        "embedding_model": DEFAULT_EMBEDDING_MODEL,
+        "description": f"SWE-bench Arm B: {repo} @ {base_commit[:12]} (instance {instance_id})",
     })
     hive_id = hive["id"]
-    print(f"[index] created hive {hive_id}")
+    print(f"[index] created hive {hive_id} (model={DEFAULT_EMBEDDING_MODEL})")
 
     cfg = _neohive_req("POST", f"/api/hives/{hive_id}/sync-configs", {
-        "repo_url": f"file://{mirror.resolve()}",
-        "branch": SYNTH_BRANCH,
+        "repo_url": https_url,
+        "branch": branch,
         "file_blocklist": DEFAULT_TEST_BLOCKLIST,
-        "sync_interval_minutes": 0,  # one-shot; we trigger the initial sync below
     })
     cfg_id = cfg["id"]
-    print(f"[index] created sync-config {cfg_id} (repo_url=file://{mirror}, branch={SYNTH_BRANCH})")
+    print(f"[index] sync-config {cfg_id} (repo={https_url}, branch={branch}); polling (GET-only)...")
 
-    # POST /sync-configs auto-dispatches an initial sync; poll until indexed.
+    # POST sync-config auto-dispatches the initial sync. Do NOT re-trigger — extra
+    # triggers just re-queue redundant syncs. First sync also downloads + warms the
+    # embedding model, so be patient.
     deadline = time.time() + poll_timeout
     while time.time() < deadline:
         cur = _neohive_req("GET", f"/api/hives/{hive_id}/sync-configs/{cfg_id}")
+        if cur.get("error_message"):
+            raise SystemExit(f"[index] sync error for {instance_id}: {cur['error_message']}")
         sha = cur.get("last_indexed_sha")
         if sha:
-            print(f"[index] READY — hive {hive_id} indexed at {sha[:12]}")
+            assert sha == base_commit, f"indexed {sha} != base_commit {base_commit}"
+            print(f"[index] READY — hive {hive_id} indexed at {sha[:12]} == base_commit")
             return hive_id
-        time.sleep(3)
-    raise SystemExit(f"[index] sync did not reach readiness within {poll_timeout}s (hive {hive_id})")
+        time.sleep(20)
+    raise SystemExit(f"[index] sync not ready within {poll_timeout}s (hive {hive_id})")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Index one SWE-bench instance @ base_commit into NeoHive (Arm B).")
     ap.add_argument("instance_id")
     ap.add_argument("--workdir", default=os.environ.get("ARMB_WORKDIR", ".localdata/armb"))
-    ap.add_argument("--guard-only", action="store_true",
-                    help="Run clone + contamination guard only (no NeoHive needed).")
-    ap.add_argument("--blobless", action="store_true",
-                    help="Faster blobless clone; OK for --guard-only, NOT for real indexing.")
-    ap.add_argument("--poll-timeout", type=int, default=900)
+    ap.add_argument("--guard-only", action="store_true", help="Clone + contamination guard only (no publish, no NeoHive).")
+    ap.add_argument("--poll-timeout", type=int, default=900, help="Seconds to wait for indexing (cold model warmup is slow).")
     args = ap.parse_args()
 
     inst = load_instance(args.instance_id)
     repo, base_commit = inst["repo"], inst["base_commit"]
-    mirror = Path(args.workdir) / args.instance_id / "repo"
+    cache = Path(args.workdir) / "repos" / repo.replace("/", "__")
 
-    clone_at_base(repo, base_commit, mirror, blobless=args.blobless or args.guard_only)
-    contamination_guard(mirror, inst.get("patch", ""), inst.get("test_patch", ""))
+    ensure_repo_cache(repo, base_commit, cache)
+    branch = make_branch(cache, args.instance_id, base_commit)
+    contamination_guard(cache, args.instance_id, base_commit, inst.get("patch", ""), inst.get("test_patch", ""))
 
     if args.guard_only:
-        print(f"[index] guard-only OK for {args.instance_id} (no NeoHive ingestion).")
+        print(f"[index] guard-only OK for {args.instance_id}.")
         return 0
 
-    hive_id = index_into_neohive(args.instance_id, repo, mirror, args.poll_timeout)
+    ssh_url, https_url = ensure_mirror(repo)
+    publish_branch(cache, ssh_url, branch)
+    hive_id = index_into_neohive(args.instance_id, repo, https_url, branch, base_commit, args.poll_timeout)
     print(f"NEOHIVE_HIVE={hive_id}")  # consumed by run_arm_b.sh
     return 0
 

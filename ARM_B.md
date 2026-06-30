@@ -44,20 +44,28 @@ checks; after applying the gold fix, the reverse check flips to "already present
 A `file_blocklist` of test dirs is also sent to the sync-config as defense in
 depth, but the structural guard is the real guarantee.
 
-## Pinning `base_commit` despite branch-only sync
+## Pinning `base_commit` via a public mirror (the audit artifact)
 
 NeoHive's git sync indexes a **branch tip**, not an arbitrary commit
-(`server/src/services/sync/index.ts` → `cloneRepo(repoUrl, branch)`). To pin a
-commit we clone locally, create branch `swebench-base` at `base_commit`, and
-point a sync-config at that local repo (`repo_url=file://…`, `branch=swebench-base`).
-This reuses NeoHive's real code-embedding path (a `repo`-type hive, server-default
-code embeddings) — which is what makes Arm B a fair test — with no GitHub remote
-or credentials.
+(`server/src/services/sync/index.ts` → `cloneRepo(repoUrl, branch)` does
+`git clone --branch <ref> --single-branch --depth 1`). It needs a remote **ref**,
+not a SHA, and the hosted server can't reach a `file://` mirror on the laptop. So
+per upstream project we publish a **public mirror** under `NeoHiveAI`
+(`swebench-mirror-<repo>`) with a branch `swebench/<instance_id>` pinned at
+`base_commit`, and point NeoHive at it.
 
-Ingestion sequence (confirmed against server routes):
-1. `POST /api/hives`  header `X-HiveMind-Id: <project>`  body `{name, type:"repo", description}`
-2. `POST /api/hives/<hiveId>/sync-configs`  `{repo_url:"file://…", branch:"swebench-base", file_blocklist}` (auto-dispatches the initial sync)
-3. Poll `GET …/sync-configs/<id>` until `last_indexed_sha` is set.
+The mirror doubles as the **open-source transparency artifact**: the bench repo
+embeds it as a submodule pinned at `base_commit`, so anyone can `git clone
+--recurse-submodules` and inspect the exact indexed tree, and verify
+`branch SHA == dataset base_commit` (git content-addressing makes that a complete
+proof of what was fed to the model — directly answering data-tainting concerns).
+
+Publishing (`index_instance.py`): clone the upstream once (cached per repo; full
+clone, since GitHub rejects shallow pushes), branch at `base_commit`, push to the
+mirror. Ingestion sequence (validated against the hosted server):
+1. `POST /api/hives`  header `X-HiveMind-Id: <project>`  body `{name, type:"repo", embedding_model, description}`
+2. `POST /api/hives/<hiveId>/sync-configs`  `{repo_url:"https://github.com/NeoHiveAI/swebench-mirror-<repo>.git", branch:"swebench/<id>", file_blocklist}` (auto-dispatches the initial sync — do NOT re-trigger; extra triggers just re-queue redundant syncs)
+3. Poll `GET …/sync-configs/<id>` until `last_indexed_sha == base_commit`.
 
 ## Per-instance isolation → one-at-a-time loop
 
@@ -83,43 +91,45 @@ on first contact:
 - The container reaches the **public** host directly (normal egress in the agent
   phase) — no `host.docker.internal`, no `--add-host`.
 
-## Status
+## Status — full hosted loop validated end-to-end ✅ (2026-06-30, `psf__requests-1142`)
 
-- ✅ **Shim (HIVE-265) validated end-to-end** against the hosted NeoHive through CF
-  (`initialize` → `memory_recall` returns results, ~0.5 s).
-- ✅ **Contamination guard (HIVE-268) validated offline** (psf__requests-1142, + a
-  negative test).
-- ⛔ **Indexing ingestion (HIVE-268) BLOCKED on hosted.** The `file://` local-mirror
-  trick assumed a co-located NeoHive; the hosted server cannot reach a `file://`
-  path on this laptop. And NeoHive's sync `cloneRepo` does
-  `git clone --branch <branch> --single-branch --depth 1` — it needs a remote
-  **ref** (branch/tag), not a SHA, so it can neither pin `base_commit` from the
-  public repo nor accept a local mirror. (Code-via-`/uploads` is capped at 20
-  files/batch + uses the markdown path, so it is not a viable whole-repo route.)
+- ✅ **Mirror + audit artifact** — `NeoHiveAI/swebench-mirror-requests`, branch
+  `swebench/psf__requests-1142`, remote ref **== `base_commit`** (`22623bd8c265…`).
+- ✅ **Contamination guard** — passes on the clean base; flips to CONTAMINATED after
+  applying the gold fix (negative test). Structural, has teeth.
+- ✅ **Indexing** — `repo` hive synced the mirror branch; `last_indexed_sha == base_commit`.
+- ✅ **Code-aware retrieval** — with the text model, a code-intent query returned
+  `.rst` docs; after switching the hive to **`google/embeddinggemma-300m-code`** and
+  re-syncing, the same query returned **source** (`requests/models.py`,
+  `urllib3/filepost.py`). So per-instance hives pin `google/embeddinggemma-300m-code`.
+- ✅ **Shim** — `memory_recall` scoped to the instance hive through CF, ~0.5 s.
 
-  Resolving this is a fork (pending decision):
-  - **A — add commit-pinning to NeoHive sync** (clone full + `git checkout <commit>`,
-    new `commit`/`ref` field on sync-config). Clean, general, dogfoods NeoHive;
-    needs a MemVec PR + redeploy of the hosted instance.
-  - **B — push synthetic `swebench-<id>` branches to a throwaway remote** NeoHive can
-    clone (e.g. a private logilica GitHub repo). No server change; per-instance
-    push overhead + cleanup.
+### Embedding model
+The dev box can't fit the 3584-dim `nomic-embed-code*` models ("Won't fit").
+`google/embeddinggemma-300m-code` (768-dim, ~0.5 GB, code-mode) fits and is what
+makes Arm B a *code* retrieval test. To change a hive's model you do NOT delete +
+recreate — change it in place in the FE (triggers re-embed) or `POST …/re-embed`.
 
-## Other open items
+## Remaining
 
+- **Submodule wiring.** Embed each mirror as a submodule (`indexed/<instance_id>`,
+  pinned at `base_commit`) in this bench repo — the public audit trail.
+- **Run the A/B.** Run `run_arm_b.sh` for an instance and compare resolved-rate vs
+  the Arm-A control on the same instance.
+- **Scale + publish-method.** `index_instance.py` currently full-clones + pushes per
+  upstream (cached). For the full 500, prefer server-side fork + `create-ref` (no
+  local transfer). First sync per fresh model is slow (~6 min: download + warmup).
 - **In-container python.** The shim is invoked as `python /opt/neohive/neohive_search.py`;
   confirm the testbed conda `python` is on PATH under `bash -c` (BASH_ENV sources
-  the image's `.bashrc` → `conda activate testbed`).
-- **Embedding model.** `repo` hives default to `nomic-embed-text-v2-moe`; decide
-  whether to pin a code-specific model via `NEOHIVE_EMBEDDING_MODEL` for fairness.
+  the image's `.bashrc` → `conda activate testbed`) on the first real Arm-B run.
 
 ## Run
 
 ```sh
-# 5-instance Arm-B smoke (CF creds come from ~/.zshrc; needs a model key + the
-# indexing fork resolved). NeoHive has no Auth0, so no PAT — CF token only:
+# 5-instance Arm-B smoke (CF creds come from ~/.zshrc; needs a model key).
+# NeoHive has no Auth0, so no PAT — CF token only. Project "SWE Bench":
 OPENROUTER_API_KEY=... NEOHIVE_BASE=https://neohive.logilica.com \
-NEOHIVE_PROJECT=<uuid> \
+NEOHIVE_PROJECT=e873808e-5333-4641-9f25-c75bbc5744ff \
 ./run_arm_b.sh openrouter/z-ai/glm-5.2 0:5
 
 # then grade exactly like Arm A:

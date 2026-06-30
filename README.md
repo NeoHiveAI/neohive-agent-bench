@@ -19,8 +19,44 @@ SWE-bench Verified. Linear project: **Agent Benchmarking** (HIVE).
 | `pilot_subset.json` / `.md` | HIVE-288 | The pinned 30-instance pilot + distribution |
 | `REACHABILITY_FINDINGS.md` | HIVE-263 | MCP reachability spike writeup |
 | `mcp_reachability_probe.sh` + `mcp_roundtrip.py` | HIVE-263 | Runnable `memory_store→recall` probe |
+| `run_swebench.sh` | HIVE-264 | Run the harness on the pilot subset (Arm A control) |
+| `pilot_filter.py` | HIVE-264 | Emit the `--filter` regex matching exactly the pinned 30 |
 
-## Quickstart
+## Scaffold: mini-swe-agent
+We use **mini-swe-agent** (the SWE-bench team's ~100-LOC, bash-only agent) as the
+harness — it's model-agnostic via LiteLLM (covers OpenRouter open models +
+frontier), uses no provider-specific tool-calling (so it runs with *any* model),
+and its minimalism keeps the A/B delta clean. See HIVE-264 for the rationale.
+
+## Setup
+```sh
+python3 -m venv .venv
+.venv/bin/pip install mini-swe-agent datasets
+```
+
+## Run the pilot (HIVE-264)
+`run_swebench.sh` runs the harness on the pinned 30 (`--subset verified
+--split test`, filtered to exactly our instance IDs). Arm A is the control
+(stock config); Arm B (NeoHive) lands in HIVE-265.
+
+```sh
+# cheap 5-instance smoke on an open model (~$0.50):
+OPENROUTER_API_KEY=... ./run_swebench.sh openrouter/deepseek/deepseek-chat a 4 0:5
+# full 30-instance Arm-A pilot:
+OPENROUTER_API_KEY=... ./run_swebench.sh openrouter/deepseek/deepseek-chat a 8
+```
+
+**Model strings (LiteLLM)** — verify against the current LiteLLM/OpenRouter model
+list before pinning in HIVE-266:
+- Open (OpenRouter): `openrouter/deepseek/deepseek-chat`, `openrouter/z-ai/glm-4.6`, `openrouter/moonshotai/kimi-k2.5`
+- Frontier: `anthropic/claude-opus-4-8`, `openai/gpt-5.5`
+
+**Needs to run:** a model API key for the chosen provider + Docker (per-instance
+images are pulled on first use; multi-GB). The dataset+filter selection is
+validated (it resolves to exactly the pinned 30); the model call + Docker run is
+the only remaining step.
+
+## Other utilities
 ```sh
 python3 select_pilot_subset.py        # regenerate the pinned pilot subset (deterministic)
 

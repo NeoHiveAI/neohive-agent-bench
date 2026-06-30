@@ -75,9 +75,15 @@ def project_hives() -> list[dict]:
 
 
 def purge_project_hives() -> None:
+    # Only repo hives break per-instance isolation (other instances' indexed code).
+    # The auto-managed "knowledge" hive is immutable (DELETE -> 403) and project-level,
+    # so leave it. (Cross-instance leakage via stored learnings in Knowledge is a
+    # separate concern tracked for the full sweep.)
     for h in project_hives():
+        if h.get("type") != "repo":
+            continue
         idx._neohive_req("DELETE", f"/api/hives/{h['id']}")
-        print(f"[armb] purged stale hive {h['id']} ({h.get('name')})")
+        print(f"[armb] purged stale repo hive {h['id']} ({h.get('name')})")
 
 
 def delete_hive(hive_id: str) -> None:

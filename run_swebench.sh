@@ -20,6 +20,13 @@
 #   # full 30-instance Arm-A pilot:
 #   ./run_swebench.sh openrouter/deepseek/deepseek-chat a 8
 set -euo pipefail
+# Many newer OpenRouter models (glm-5.2, kimi, deepseek-v3.2, ...) aren't in
+# LiteLLM's price map, which otherwise crashes the run during cost calc right
+# after the first model response. We track cost ourselves (HIVE-273), so tell
+# mini-swe-agent to ignore its internal cost-tracking errors. NOTE: this also
+# neutralizes the config's per-instance cost_limit (cost reads as $0), so the
+# step_limit (250) is the runaway guard.
+export MSWEA_COST_TRACKING="${MSWEA_COST_TRACKING:-ignore_errors}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 VENV="$HERE/.venv/bin"
 

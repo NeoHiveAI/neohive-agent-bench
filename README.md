@@ -24,7 +24,7 @@ SWE-bench Verified. Linear project: **Agent Benchmarking** (HIVE).
 | `index_instance.py` | HIVE-268 | Clone repo @ `base_commit` → contamination guard → publish public mirror → index a per-instance code-embedding NeoHive hive |
 | `fetch_opencode.sh` | HIVE-265 | Fetch the pinned opencode linux-x64 binary (mounted into every container) |
 | `config/opencode-arm-a.json` / `-arm-b.json` | HIVE-265 | The two opencode configs; differ **only** by the `mcp.neohive` block |
-| `run_opencode.py` *(to build)* | HIVE-265/268 | Per-instance, per-arm runner: opencode in-container → `git diff` → `preds.json` |
+| `run_opencode.py` | HIVE-265/268 | Per-instance, per-arm runner: opencode in-container → `git diff` → `preds.json` |
 | `run_swebench.sh` + `pilot_filter.py` | HIVE-264 | Earlier mini-swe-agent harness used to validate the grading pipeline end-to-end (stepping stone; the A/B experiment uses opencode) |
 
 ## Scaffold: opencode (both arms)

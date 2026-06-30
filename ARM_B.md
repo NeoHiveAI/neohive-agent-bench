@@ -38,7 +38,7 @@ shows `neohive connected` through CF → `opencode run` with `glm-4.6` calls
 | `index_instance.py` | HIVE-268: clone repo @ `base_commit` → branch → contamination guard → publish public mirror → create + index a per-instance code-embedding NeoHive hive. |
 | `fetch_opencode.sh` | Fetch the pinned opencode linux-x64 binary (mounted into every container). |
 | `config/opencode-arm-a.json` / `-arm-b.json` | The two opencode configs; they differ **only** by the `mcp.neohive` block. |
-| `run_opencode.py` *(to build)* | Per-instance, per-arm runner: `docker run` the image with opencode mounted → write the arm config → `opencode run "<problem_statement>"` in `/testbed` → `git diff` → `preds.json` → grade with `grade_swebench.sh`. |
+| `run_opencode.py` | Per-instance, per-arm runner: `docker run` the image with opencode mounted → `docker cp` the arm config → `opencode run "<problem_statement>"` in `/testbed` → `git diff` → `preds.json`. Arm B purges + indexes the hive (temporal isolation) and deletes it after. Grade with `grade_swebench.sh`. |
 
 ## Contamination guard — structural, and validated
 
@@ -131,13 +131,13 @@ recreate — change it in place in the FE (triggers re-embed) or `POST …/re-em
 
 ## Remaining
 
-- **Build `run_opencode.py`** — the per-instance, per-arm runner: `docker run` the
-  swebench image with the pinned opencode mounted → `docker cp` the arm config to
-  `/root/.config/opencode/` (outside `/testbed` so it never pollutes the diff) →
-  `opencode run "<problem_statement>"` in `/testbed` with a budget → `git diff` →
-  `preds.json` → cleanup. Arm B first indexes the instance (`index_instance.py`) and
-  tears the hive down after (temporal isolation). Then grade with `grade_swebench.sh`.
-- **First A/B** — run both arms on `psf__requests-1142` (already indexed) and compare.
+- **First A/B** — `run_opencode.py` is built (helpers validated; the in-container
+  opencode+MCP flow is validated). Run both arms on `psf__requests-1142` and compare
+  resolved-rate, then expand to the pilot.
+- **Methodology — Arm-B usage nudge?** Decide whether Arm B should include a brief
+  "a semantic memory of this repo is available via the neohive MCP tools" instruction
+  (mirroring NeoHive's end-user CLAUDE.md rules/hooks) or stay identical-prompt
+  (single variable; the model uses the MCP tools only if it chooses).
 - **Submodule wiring.** Embed each mirror as a submodule (`indexed/<instance_id>`,
   pinned at `base_commit`) in this bench repo — the public audit trail.
 - **Scale + publish-method.** `index_instance.py` full-clones + pushes per upstream

@@ -19,32 +19,40 @@ SWE-bench Verified. Linear project: **Agent Benchmarking** (HIVE).
 | `pilot_subset.json` / `.md` | HIVE-288 | The pinned 30-instance pilot + distribution |
 | `REACHABILITY_FINDINGS.md` | HIVE-263 | MCP reachability spike writeup |
 | `mcp_reachability_probe.sh` + `mcp_roundtrip.py` | HIVE-263 | Runnable `memory_store→recall` probe |
-| `run_swebench.sh` | HIVE-264 | Run the harness on the pilot subset (Arm A control) |
-| `pilot_filter.py` | HIVE-264 | Emit the `--filter` regex matching exactly the pinned 30 |
 | `grade_swebench.sh` | HIVE-264 | Grade a run's `preds.json` against the hidden tests (resolved/unresolved) |
-| `ARM_B.md` | HIVE-265/268 | Arm-B (NeoHive treatment) design + open items |
-| `index_instance.py` | HIVE-268 | Clone repo @ `base_commit` → contamination guard → index into a per-instance NeoHive hive |
-| `neohive_search.py` | HIVE-265 | In-container retrieval shim: `memory_recall` over the instance's hive via MCP |
-| `config/arm_b_neohive.yaml` | HIVE-265 | mini-swe-agent overlay adding the shim + host networking (and nothing else) |
-| `run_arm_b.sh` | HIVE-265/268 | Arm-B orchestrator: per-instance index → run → merge into one `preds.json` |
+| `ARM_B.md` | HIVE-265/268 | Arm-B (opencode + NeoHive MCP) design + status |
+| `index_instance.py` | HIVE-268 | Clone repo @ `base_commit` → contamination guard → publish public mirror → index a per-instance code-embedding NeoHive hive |
+| `fetch_opencode.sh` | HIVE-265 | Fetch the pinned opencode linux-x64 binary (mounted into every container) |
+| `config/opencode-arm-a.json` / `-arm-b.json` | HIVE-265 | The two opencode configs; differ **only** by the `mcp.neohive` block |
+| `run_opencode.py` *(to build)* | HIVE-265/268 | Per-instance, per-arm runner: opencode in-container → `git diff` → `preds.json` |
+| `run_swebench.sh` + `pilot_filter.py` | HIVE-264 | Earlier mini-swe-agent harness used to validate the grading pipeline end-to-end (stepping stone; the A/B experiment uses opencode) |
 
-## Scaffold: mini-swe-agent
-We use **mini-swe-agent** (the SWE-bench team's ~100-LOC, bash-only agent) as the
-harness — it's model-agnostic via LiteLLM (covers OpenRouter open models +
-frontier), uses no provider-specific tool-calling (so it runs with *any* model),
-and its minimalism keeps the A/B delta clean. See HIVE-264 for the rationale.
+## Scaffold: opencode (both arms)
+The A/B uses **opencode** (model-agnostic via OpenRouter, MCP-native), run **inside**
+each SWE-bench container so the agent has the repo's deps and can run tests. Arm A
+and Arm B are the *same* opencode setup; the only difference is whether NeoHive is
+connected as an MCP server (`config/opencode-arm-b.json`). The agent then uses
+NeoHive's MCP tools (`memory_recall`, …) natively — exactly how a NeoHive end-user's
+agent does. See `ARM_B.md`. (HIVE-264 first used mini-swe-agent to validate the
+grading pipeline — that's `run_swebench.sh`, kept as a stepping stone.)
 
 ## Setup
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install mini-swe-agent datasets   # rollout (run_swebench.sh)
-.venv/bin/pip install swebench                  # grading  (grade_swebench.sh)
+.venv/bin/pip install datasets swebench   # dataset access + grading (grade_swebench.sh)
+./fetch_opencode.sh                       # pinned opencode binary for the containers
+# (run_swebench.sh, the HIVE-264 validation harness, also needs: pip install mini-swe-agent)
 ```
 
-## Run the pilot (HIVE-264)
-`run_swebench.sh` runs the harness on the pinned 30 (`--subset verified
---split test`, filtered to exactly our instance IDs). Arm A is the control
-(stock config); Arm B (NeoHive) lands in HIVE-265.
+## The A/B experiment → see `ARM_B.md`
+Both arms run **opencode** in-container; Arm B adds NeoHive as an MCP server.
+`index_instance.py` indexes each repo @ `base_commit`; `run_opencode.py` (to build)
+runs an instance per arm; `grade_swebench.sh` scores the patches. Start there.
+
+## Legacy: mini-swe-agent grading validation (HIVE-264)
+`run_swebench.sh` ran the SWE-bench team's bash-only mini-swe-agent on the pinned 30
+to validate the runner + grading pipeline end-to-end (graded 3/5 on a glm smoke). The
+A/B experiment moved to opencode (real MCP usage); this is kept as a stepping stone.
 
 ```sh
 # cheap 5-instance smoke on an open model (~$0.50):

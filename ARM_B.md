@@ -1,32 +1,44 @@
 # Arm B — the NeoHive treatment arm (HIVE-265 + HIVE-268)
 
-Arm B is Arm A's *exact* harness plus NeoHive: each SWE-bench instance's repo is
-indexed at `base_commit` into its own NeoHive hive, and the agent is given a
-`neohive-search` command to retrieve over it. Comparing Arm A vs Arm B resolved
-rates per model is the whole experiment.
+Arm B is Arm A's *exact* harness plus NeoHive **connected as a real MCP server**:
+each SWE-bench instance's repo is indexed at `base_commit` into a NeoHive hive, and
+the agent uses NeoHive's MCP tools (`memory_recall`, `memory_context`, …) natively
+and autonomously — exactly how a NeoHive end-user's coding agent does. Comparing
+Arm A vs Arm B resolved rates per model is the whole experiment.
 
-## The key reframe: bash shim, not MCP injection
+## Approach: opencode + NeoHive MCP (not a bash shim)
 
-HIVE-265 was originally written assuming a Claude-Code-style agent ("inject the
-MCP connection + getting-started skill"). Our chosen scaffold is **mini-swe-agent,
-which is bash-only** — it has no MCP client and no skill system. Its single
-actuator is bash commands, executed **inside** the per-instance container
-(`docker exec`, cwd `/testbed`).
+The scaffold is **opencode** (model-agnostic via OpenRouter, MCP-native), run
+**inside** each SWE-bench container so the agent has the repo's deps and can run
+tests. Arm A and Arm B are the *same* opencode setup; the **only** difference is one
+config key:
 
-Consequently NeoHive cannot be a host-side MCP tool (HIVE-263's "Pattern 1 is
-free"). Retrieval has to be a **bash command the agent runs in the container**
-that reaches the host NeoHive — the in-container "Pattern 2" case the HIVE-263
-probe was built to de-risk. So HIVE-265 becomes: install a `neohive-search` shim
-+ teach the agent about it via a one-key system-prompt overlay.
+- **Arm A** — `config/opencode-arm-a.json` (`permission: {"*":"allow"}`, no MCP).
+- **Arm B** — `config/opencode-arm-b.json` — identical plus an `mcp.neohive` remote
+  server pointing at the instance's NeoHive project, with the Cloudflare Access
+  service token in `headers`. The model then *chooses* to call NeoHive's MCP tools.
+
+This replaces the earlier hand-rolled `neohive-search` bash shim, which only
+measured "agent runs a command we told it to" rather than "agent uses NeoHive like
+a user would". Because opencode is a real MCP client running the agent loop, the
+NeoHive MCP connection is **host-/agent-side relative to the model** and reaches
+NeoHive's public CF endpoint directly — vindicating HIVE-263's "Pattern 1".
+
+Validated end-to-end (2026-06-30/07-01): opencode 1.17.10 mounted into the
+`psf__requests-1142` image (runs under amd64 emulation) → `opencode mcp list`
+shows `neohive connected` through CF → `opencode run` with `glm-4.6` calls
+`neohive_memory_recall` and returns source (`requests/models.py`,
+`urllib3/filepost.py`). CF gotcha: opencode's MCP client must send an explicit
+`User-Agent` header (CF WAF Error 1010 blocks default UAs).
 
 ## Components
 
 | File | Role |
 |---|---|
-| `index_instance.py` | HIVE-268: clone repo @ `base_commit` → synthetic branch → contamination guard → create + index a per-instance NeoHive hive. |
-| `neohive_search.py` | HIVE-265: the in-container shim. `memory_recall` over the instance's hive via MCP (stdlib only); prints ranked code chunks. |
-| `config/arm_b_neohive.yaml` | HIVE-265: mini-swe-agent overlay. Adds the shim mount, host networking, forwarded env, and the system-prompt affordance — and nothing else. |
-| `run_arm_b.sh` | Orchestrator: per-instance loop (index → set env → run one instance), merging into one `preds.json`. |
+| `index_instance.py` | HIVE-268: clone repo @ `base_commit` → branch → contamination guard → publish public mirror → create + index a per-instance code-embedding NeoHive hive. |
+| `fetch_opencode.sh` | Fetch the pinned opencode linux-x64 binary (mounted into every container). |
+| `config/opencode-arm-a.json` / `-arm-b.json` | The two opencode configs; they differ **only** by the `mcp.neohive` block. |
+| `run_opencode.py` *(to build)* | Per-instance, per-arm runner: `docker run` the image with opencode mounted → write the arm config → `opencode run "<problem_statement>"` in `/testbed` → `git diff` → `preds.json` → grade with `grade_swebench.sh`. |
 
 ## Contamination guard — structural, and validated
 
@@ -67,13 +79,15 @@ mirror. Ingestion sequence (validated against the hosted server):
 2. `POST /api/hives/<hiveId>/sync-configs`  `{repo_url:"https://github.com/NeoHiveAI/swebench-mirror-<repo>.git", branch:"swebench/<id>", file_blocklist}` (auto-dispatches the initial sync — do NOT re-trigger; extra triggers just re-queue redundant syncs)
 3. Poll `GET …/sync-configs/<id>` until `last_indexed_sha == base_commit`.
 
-## Per-instance isolation → one-at-a-time loop
+## Per-instance isolation → one hive in the project at a time
 
-Each instance needs retrieval scoped to *its* repo. The shim takes `NEOHIVE_HIVE`
-to scope `memory_recall` to one hive. mini-swe-agent's batch runner uses one
-config for the whole batch, so per-instance hive scoping forces a one-instance-per-
-invocation loop (`--filter "^<id>$"`). All runs merge into one `preds.json`
-(`update_preds_file` keys by instance_id), so grading is unchanged.
+Each instance's agent must retrieve only over *its* repo. The agent calls
+`memory_recall` without a hive arg, so recall fans across **all hives in the
+project** — meaning a shared project would leak other instances' repos. Per-instance
+*projects* aren't feasible (hosted project-create is broken, dashboard-only). So we
+enforce isolation **temporally**: the runner keeps exactly one hive in the "SWE
+Bench" project at a time — index instance → run opencode → delete the hive → next.
+The per-instance runs each write their own `preds.json`; grading is unchanged.
 
 ## Target: hosted `neohive.logilica.com` (Cloudflare Access, no Auth0/PAT)
 
@@ -86,10 +100,11 @@ on first contact:
 - **MCP route is `/projects/:id/mcp`** on this deployment (NOT `/hiveminds/:id/mcp`).
 - **REST is `/api/hives` + `X-HiveMind-Id: <project>` header** (gateway-level).
 - **CF WAF Error 1010 gotcha:** Cloudflare blocks the default `Python-urllib/x.y`
-  User-Agent. The shim + indexer set an explicit `User-Agent` (any non-default UA
-  passes). Without it every request 403s — and the in-container shim hits this too.
-- The container reaches the **public** host directly (normal egress in the agent
-  phase) — no `host.docker.internal`, no `--add-host`.
+  User-Agent. opencode's MCP client (via the config `headers`) and the indexer both
+  set an explicit `User-Agent` (any non-default UA passes). Without it every request
+  403s — and opencode in-container hits this too.
+- opencode in-container reaches the **public** NeoHive host directly (normal egress
+  in the agent phase) — no `host.docker.internal`, no `--add-host`.
 
 ## Status — full hosted loop validated end-to-end ✅ (2026-06-30, `psf__requests-1142`)
 
@@ -102,7 +117,11 @@ on first contact:
   `.rst` docs; after switching the hive to **`google/embeddinggemma-300m-code`** and
   re-syncing, the same query returned **source** (`requests/models.py`,
   `urllib3/filepost.py`). So per-instance hives pin `google/embeddinggemma-300m-code`.
-- ✅ **Shim** — `memory_recall` scoped to the instance hive through CF, ~0.5 s.
+- ✅ **opencode MCP (host test)** — `memory_recall` scoped to the instance hive through CF, ~0.5 s.
+- ✅ **opencode in-container** — pinned 1.17.10 binary mounted into the `requests-1142`
+  image (amd64 emulation); `opencode mcp list` → `neohive connected` via CF; `opencode
+  run` with `glm-4.6` called `neohive_memory_recall` and returned source. The full
+  in-container Arm-B mechanism works.
 
 ### Embedding model
 The dev box can't fit the 3584-dim `nomic-embed-code*` models ("Won't fit").
@@ -112,26 +131,32 @@ recreate — change it in place in the FE (triggers re-embed) or `POST …/re-em
 
 ## Remaining
 
+- **Build `run_opencode.py`** — the per-instance, per-arm runner: `docker run` the
+  swebench image with the pinned opencode mounted → `docker cp` the arm config to
+  `/root/.config/opencode/` (outside `/testbed` so it never pollutes the diff) →
+  `opencode run "<problem_statement>"` in `/testbed` with a budget → `git diff` →
+  `preds.json` → cleanup. Arm B first indexes the instance (`index_instance.py`) and
+  tears the hive down after (temporal isolation). Then grade with `grade_swebench.sh`.
+- **First A/B** — run both arms on `psf__requests-1142` (already indexed) and compare.
 - **Submodule wiring.** Embed each mirror as a submodule (`indexed/<instance_id>`,
   pinned at `base_commit`) in this bench repo — the public audit trail.
-- **Run the A/B.** Run `run_arm_b.sh` for an instance and compare resolved-rate vs
-  the Arm-A control on the same instance.
-- **Scale + publish-method.** `index_instance.py` currently full-clones + pushes per
-  upstream (cached). For the full 500, prefer server-side fork + `create-ref` (no
-  local transfer). First sync per fresh model is slow (~6 min: download + warmup).
-- **In-container python.** The shim is invoked as `python /opt/neohive/neohive_search.py`;
-  confirm the testbed conda `python` is on PATH under `bash -c` (BASH_ENV sources
-  the image's `.bashrc` → `conda activate testbed`) on the first real Arm-B run.
+- **Scale + publish-method.** `index_instance.py` full-clones + pushes per upstream
+  (cached). For the full 500, prefer server-side fork + `create-ref` (no local
+  transfer). First sync per fresh model is slow (~6 min: download + warmup).
 
 ## Run
 
 ```sh
-# 5-instance Arm-B smoke (CF creds come from ~/.zshrc; needs a model key).
-# NeoHive has no Auth0, so no PAT — CF token only. Project "SWE Bench":
-OPENROUTER_API_KEY=... NEOHIVE_BASE=https://neohive.logilica.com \
-NEOHIVE_PROJECT=e873808e-5333-4641-9f25-c75bbc5744ff \
-./run_arm_b.sh openrouter/z-ai/glm-5.2 0:5
+# 0) one-time: fetch the pinned opencode binary (mounted into every container)
+./fetch_opencode.sh
 
-# then grade exactly like Arm A:
-./grade_swebench.sh results/armb-<...>/preds.json armb-glm52-smoke 2
+# 1) per-instance A/B (run_opencode.py — to build). CF creds come from ~/.zshrc;
+#    needs OPENROUTER_API_KEY. NeoHive has no Auth0 → no PAT, CF token only.
+OPENROUTER_API_KEY=... NEOHIVE_PROJECT=e873808e-5333-4641-9f25-c75bbc5744ff \
+  ./.venv/bin/python run_opencode.py --arm a --model openrouter/z-ai/glm-4.6 psf__requests-1142
+OPENROUTER_API_KEY=... NEOHIVE_PROJECT=e873808e-5333-4641-9f25-c75bbc5744ff \
+  ./.venv/bin/python run_opencode.py --arm b --model openrouter/z-ai/glm-4.6 psf__requests-1142
+
+# 2) grade either arm's preds.json (identical to Arm A)
+./grade_swebench.sh results/<arm>-<...>/preds.json <run_id> 2
 ```

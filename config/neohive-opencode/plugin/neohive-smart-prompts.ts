@@ -16,25 +16,30 @@
 //     (CF-Access-Client-Id/Secret) + an explicit User-Agent. NeoHive sits behind
 //     Cloudflare; the CF WAF (Error 1010) blocks default/empty User-Agents, so a UA
 //     is mandatory. Bearer NEOHIVE_TOKEN is still honored if present.
-//   - MODEL is an OpenRouter model (the container has OPENROUTER_API_KEY, not an
-//     Anthropic key), so the rewriter/filter run through the same provider as the
-//     main agent.
+//   - The rewrite + filter steps call the OpenRouter chat API DIRECTLY (one HTTP
+//     request each) instead of the stock template's nested `opencode run` headless
+//     sub-agent. Behaviorally identical (same prompts, same model, same inject), but
+//     the stock approach spawns a second/third full ~170MB opencode process per
+//     prompt, which OOM-kills (exit 137) the agent when the SWE-bench container runs
+//     under x86 emulation. A direct completion is a tiny fraction of the memory.
+//   - MODEL is an OpenRouter model (the container has OPENROUTER_API_KEY).
 //
 // Env: NEOHIVE_SMART_DISABLED=1 disables the hook. NEOHIVE_SMART_MODEL overrides
-// the rewriter model. Requires `opencode` on PATH (run_opencode.py symlinks it).
+// the rewriter model. OPENROUTER_API_KEY drives the rewrite/filter completions.
 
 import type { Plugin } from "@opencode-ai/plugin"
 
 const HIVE = ""  // cross-hive; the per-instance project holds exactly one hive
-const MODEL = process.env.NEOHIVE_SMART_MODEL || "openrouter/z-ai/glm-4.6"
+const MODEL = (process.env.NEOHIVE_SMART_MODEL || "openrouter/z-ai/glm-4.6").replace(/^openrouter\//, "")
 const TRIGGER = "min_len"
 const DISABLE_FLAG = "NEOHIVE_SMART_DISABLED"
 
-export default (async ({ $, directory }) => {
+export default (async ({ directory }) => {
   return {
     "chat.message": async (_input: any, output: any) => {
       try {
         if (process.env[DISABLE_FLAG] === "1") return
+        if (!process.env.OPENROUTER_API_KEY) return
 
         const userText = output.parts
           .filter((p: any) => p.type === "text")
@@ -47,9 +52,9 @@ export default (async ({ $, directory }) => {
           if (userText.startsWith("/")) return
         }
 
-        // Step 1: rewrite prompt into a recall query (headless small model)
+        // Step 1: rewrite prompt into a recall query (direct OpenRouter completion)
         const rewritePrompt = `You are a query rewriter for a semantic memory system. Given a user prompt, produce a single-line search query that would retrieve relevant stored knowledge. Use affirmative domain terms, not questions. Output ONLY the query, no preamble. Prompt: ${userText}`
-        const query = (await $`opencode run -m ${MODEL} ${rewritePrompt}`.text()).trim().slice(0, 400)
+        const query = (await chatComplete(rewritePrompt))?.trim().slice(0, 400)
         if (!query) return
 
         // Step 2: discover MCP URL
@@ -60,9 +65,9 @@ export default (async ({ $, directory }) => {
         const memoriesRaw = await callMemoryRecall(mcpUrl, query, HIVE || undefined)
         if (!memoriesRaw) return
 
-        // Step 4: filter via small model
+        // Step 4: filter via small model (direct OpenRouter completion)
         const filterPrompt = `You are filtering memory_recall results for relevance to the user's actual prompt.\n\nUser prompt: ${userText}\nRewritten query: ${query}\n\nMemory results:\n${memoriesRaw}\n\nPick the 1-3 items most relevant to the user's prompt. If none are genuinely relevant, output exactly "IRRELEVANT". Otherwise output a compact markdown block.\n\nOutput only the block, no preamble.`
-        const filtered = (await $`opencode run -m ${MODEL} ${filterPrompt}`.text()).trim().slice(0, 3000)
+        const filtered = (await chatComplete(filterPrompt))?.trim().slice(0, 3000)
         if (!filtered || filtered === "IRRELEVANT") return
 
         // Step 5: inject as extra text part
@@ -76,6 +81,28 @@ export default (async ({ $, directory }) => {
     },
   }
 }) satisfies Plugin
+
+async function chatComplete(prompt: string): Promise<string | undefined> {
+  const key = process.env.OPENROUTER_API_KEY
+  if (!key) return undefined
+  try {
+    const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 600,
+        temperature: 0,
+      }),
+      signal: AbortSignal.timeout(20000),
+    })
+    const data = await resp.json()
+    return data?.choices?.[0]?.message?.content
+  } catch {
+    return undefined
+  }
+}
 
 async function discoverNeoHiveUrl(cwd: string): Promise<string | undefined> {
   const fs = await import("node:fs/promises")

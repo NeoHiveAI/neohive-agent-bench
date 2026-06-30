@@ -41,5 +41,10 @@ Only `neohive-smart-prompts.ts` was modified, and only for our hosted target:
   (the CF WAF blocks default UAs — Error 1010). Bearer `NEOHIVE_TOKEN` still honored.
 - **Rewriter model:** an OpenRouter model (the container has `OPENROUTER_API_KEY`),
   overridable via `NEOHIVE_SMART_MODEL`.
+- **Rewrite/filter transport:** the stock template runs the rewrite + filter steps as
+  a nested `opencode run` (a second/third full opencode agent per prompt). Under x86
+  emulation that stacks multiple ~170MB processes and OOM-kills the solve (exit 137),
+  so here they're a **direct OpenRouter chat completion** instead — same prompts, same
+  model, same injected output, a fraction of the memory.
 
 The rules, the nudge plugin, the subagent, and the skills are **verbatim** copies.

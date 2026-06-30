@@ -117,15 +117,32 @@ NEOHIVE_TOOLS = ["neohive_memory_recall", "neohive_memory_context", "neohive_mem
 
 
 def parse_usage(events_text: str) -> dict:
-    """Best-effort NeoHive-usage counts from opencode --format json events + logs.
-    Counts are raw occurrences of each tool name (approximate — a call emits several
-    events) plus the smart-prompts injection marker; the point is to PROVE usage."""
-    import re
-    usage = {t: len(re.findall(re.escape(f'"{t}"'), events_text)) for t in NEOHIVE_TOOLS}
-    usage["explore_neohive_dispatch"] = len(re.findall("explore-neohive", events_text))
-    usage["smart_context_injections"] = events_text.count("NeoHive smart context")
-    usage["used_neohive"] = any(v for k, v in usage.items() if k != "used_neohive")
-    return usage
+    """Accurate NeoHive-usage from opencode --format json events: count tool_use
+    parts whose tool is a NeoHive MCP tool (not regex over the raw text, which
+    conflates a real call with the tool merely being listed), plus the explore-neohive
+    subagent and the smart-prompts injection marker."""
+    counts = {t: 0 for t in NEOHIVE_TOOLS}
+    explore = 0
+    for line in events_text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        part = e.get("part") if isinstance(e.get("part"), dict) else {}
+        if part.get("type") == "tool":
+            tool = part.get("tool", "")
+            if tool in counts:
+                counts[tool] += 1
+            if "explore-neohive" in str(tool) or part.get("agent") == "explore-neohive":
+                explore += 1
+    counts["explore_neohive_dispatch"] = explore
+    counts["smart_context_injections"] = events_text.count("NeoHive smart context")
+    counts["used_neohive"] = (any(counts[t] for t in NEOHIVE_TOOLS)
+                              or explore > 0 or counts["smart_context_injections"] > 0)
+    return counts
 
 
 def index_instance(instance_id: str) -> str:

@@ -47,4 +47,23 @@ Only `neohive-smart-prompts.ts` was modified, and only for our hosted target:
   so here they're a **direct OpenRouter chat completion** instead — same prompts, same
   model, same injected output, a fraction of the memory.
 
-The rules, the nudge plugin, the subagent, and the skills are **verbatim** copies.
+The rules, the subagent, and the skills are **verbatim** copies.
+
+## In-container loadability (empirically required)
+
+opencode's plugin loader, inside the SWE-bench eval images, **silently drops any plugin
+that carries `import type { Plugin } from "@opencode-ai/plugin"` / `satisfies Plugin`**
+(a no-import plugin loads and fires fine — verified with a marker plugin). It also only
+loads plugins from the **project** config, and needs a **node runtime** (the images have
+none). So the harness (`run_opencode.py`):
+- ships a pinned node (`fetch_node.sh`) mounted into each container;
+- places the opencode config **project-level in `/testbed`** (untracked → excluded from
+  the git-diff prediction);
+- and both plugins here have their type-only imports removed so they actually load.
+
+Given that, `neohive-smart-prompts.ts` was rewritten as a **verified-loadable** plugin:
+no imports, an init/inject stderr marker (`[neohive-smart] …`, the usage-telemetry
+signal), and `memory_recall` (scoped to `NEOHIVE_HIVE`, via CF) → inject on each prompt.
+The stock model-driven rewrite/filter is omitted for reliability (documented above).
+`neohive.ts` (grep-nudge) is stderr-only by opencode's design — it cannot inject context
+to steer the model — so it is effectively inert during a solve; kept for parity.

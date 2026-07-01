@@ -67,6 +67,13 @@ def opencode_bin() -> str:
     return out.stdout.strip().splitlines()[-1]
 
 
+def node_dir() -> str:
+    """Pinned node linux-x64 dir (opencode's plugin loader needs a node runtime; the
+    eval images have none). Mounted read-only into each container."""
+    out = subprocess.run([str(HERE / "fetch_node.sh")], check=True, text=True, capture_output=True)
+    return out.stdout.strip().splitlines()[-1]
+
+
 # ---- Arm-B NeoHive hive lifecycle (temporal isolation: one hive in the project at a time) ----
 
 def project_hives() -> list[dict]:
@@ -139,7 +146,10 @@ def parse_usage(events_text: str) -> dict:
             if "explore-neohive" in str(tool) or part.get("agent") == "explore-neohive":
                 explore += 1
     counts["explore_neohive_dispatch"] = explore
-    counts["smart_context_injections"] = events_text.count("NeoHive smart context")
+    # The smart-prompts plugin logs "[neohive-smart] injected N chars" to stderr on each
+    # successful auto-context injection (the injected text goes into the model's INPUT,
+    # not the output event stream, so stderr is the reliable signal).
+    counts["smart_context_injections"] = events_text.count("[neohive-smart] injected")
     counts["used_neohive"] = (any(counts[t] for t in NEOHIVE_TOOLS)
                               or explore > 0 or counts["smart_context_injections"] > 0)
     return counts
@@ -159,11 +169,13 @@ def index_instance(instance_id: str) -> str:
 
 
 def build_config_dir(arm: str, project: str | None) -> Path:
-    """Assemble the container's /root/.config/opencode/ contents for this arm.
+    """Assemble the opencode config placed PROJECT-level into the container's /testbed.
 
     Arm A: just opencode.json (permissions, no NeoHive). Arm B: opencode.json
     (permissions + MCP + instructions + plugin refs) plus the full faithful NeoHive
     setup (instructions/, plugin/ x2, agents/, skill/) from config/neohive-opencode/.
+    Placed in /testbed because opencode only loads plugins from the project config;
+    the files are untracked, so `git diff` (the prediction) excludes them.
     """
     d = Path(tempfile.mkdtemp())
     raw = (HERE / "config" / f"opencode-arm-{arm}.json").read_text()
@@ -179,7 +191,7 @@ def build_config_dir(arm: str, project: str | None) -> Path:
     return d
 
 
-def run_instance(instance_id: str, arm: str, model: str, ocbin: str, out_dir: Path,
+def run_instance(instance_id: str, arm: str, model: str, ocbin: str, nodedir: str, out_dir: Path,
                  timeout: int, project: str | None) -> None:
     inst = idx.load_instance(instance_id)
     image = image_for(instance_id)
@@ -193,18 +205,26 @@ def run_instance(instance_id: str, arm: str, model: str, ocbin: str, out_dir: Pa
         write_routing(cfgdir, inst["repo"], inst["base_commit"], hive_id)
 
     print(f"[run] arm={arm} {instance_id} model={model} image={image}" + (f" hive={hive_id}" if hive_id else ""))
-    cid = docker("run", "-d", "--rm", "-v", f"{ocbin}:/opt/oc/opencode:ro",
+    # Mount opencode + node read-only. Config goes PROJECT-level into /testbed (opencode
+    # only loads plugins from the project config; untracked files are excluded from git diff).
+    cid = docker("run", "-d", "--rm",
+                 "-v", f"{ocbin}:/opt/oc/opencode:ro",
+                 "-v", f"{nodedir}:/opt/node:ro",
                  image, "sleep", str(timeout + 600)).stdout.strip()
     try:
-        docker("exec", cid, "mkdir", "-p", "/root/.config/opencode")
-        docker("cp", f"{cfgdir}/.", f"{cid}:/root/.config/opencode/")
-        # smart-prompts shells out to `opencode` for the rewriter; put it on PATH.
+        docker("cp", f"{cfgdir}/.", f"{cid}:/testbed/")
+        # Symlink into /usr/local/bin (already on PATH) rather than overriding PATH —
+        # keeps the image's conda `testbed` env intact for the agent's own commands/tests.
         docker("exec", cid, "ln", "-sf", "/opt/oc/opencode", "/usr/local/bin/opencode", check=False)
+        docker("exec", cid, "ln", "-sf", "/opt/node/bin/node", "/usr/local/bin/node", check=False)
+        docker("exec", cid, "ln", "-sf", "/opt/node/bin/npm", "/usr/local/bin/npm", check=False)
 
         env_flags = ["-e", "OPENROUTER_API_KEY"]
         if arm == "b":
+            mcp_url = f"{os.environ.get('NEOHIVE_BASE', 'https://neohive.logilica.com').rstrip('/')}/projects/{project}/mcp"
             env_flags += ["-e", "NEOHIVE_CF_ACCESS_CLIENT_ID", "-e", "NEOHIVE_CF_ACCESS_CLIENT_SECRET",
-                          "-e", f"NEOHIVE_HIVE={hive_id}"]  # scope recall + smart-prompts to this hive
+                          "-e", f"NEOHIVE_HIVE={hive_id}",       # scope recall + smart-prompts to this hive
+                          "-e", f"NEOHIVE_MCP_URL={mcp_url}"]    # smart-prompts plugin calls this directly
         task = TASK_TEMPLATE.format(problem_statement=inst["problem_statement"])
         # --format json => raw event stream (tool calls etc.) for usage telemetry;
         # --print-logs => plugin activity (smart-prompts, grep-nudge) on stderr.
@@ -256,6 +276,7 @@ def main() -> int:
         raise SystemExit("set OPENROUTER_API_KEY")
     project = os.environ.get("NEOHIVE_PROJECT")
     ocbin = opencode_bin()
+    nodedir = node_dir()
     slug = args.model.replace("/", "_").replace(":", "_").replace(".", "_")
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out_dir = Path(args.output) if args.output else HERE / "results" / f"arm{args.arm}-{slug}-{stamp}"
@@ -264,7 +285,7 @@ def main() -> int:
 
     for iid in args.instance_ids:
         try:
-            run_instance(iid, args.arm, args.model, ocbin, out_dir, args.timeout, project)
+            run_instance(iid, args.arm, args.model, ocbin, nodedir, out_dir, args.timeout, project)
         except Exception as e:  # noqa: BLE001 — keep going across instances
             print(f"[run] ERROR on {iid}: {e}", file=sys.stderr)
 

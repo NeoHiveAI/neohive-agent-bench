@@ -36,7 +36,10 @@
  *                                  server-side; documented here for parity)
  */
 
-import type { Plugin } from "@opencode-ai/plugin"
+// NOTE: type-only `import type { Plugin }` removed — opencode's in-container plugin
+// loader silently drops plugins that carry it (empirically; a no-import plugin loads
+// fine). This plugin is stderr-only by opencode's design (it cannot inject context into
+// the model), so it is effectively inert during a solve regardless; kept for parity.
 import { existsSync, readFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { homedir } from "node:os"
@@ -158,4 +161,4 @@ export default (async ({ directory }) => {
       }
     },
   }
-}) satisfies Plugin
+})

@@ -167,21 +167,31 @@ def _neohive_req(method: str, path: str, body: dict | None = None) -> dict:
     return json.loads(raw) if raw.strip() else {}
 
 
-def index_into_neohive(instance_id: str, repo: str, https_url: str, branch: str, base_commit: str,
-                       poll_timeout: int) -> str:
-    # Idempotent: if a repo hive named for this instance is already indexed at this
-    # base_commit, reuse it (no re-index/churn). Hives accumulate in the project —
-    # one repo@commit per hive — which is the intended multi-repo NeoHive usage.
+def find_indexed_hive(instance_id: str, base_commit: str) -> str | None:
+    """Return the id of an existing repo hive for this instance already indexed at
+    base_commit, else None. Used to SHORT-CIRCUIT before any clone/mirror/push — so a
+    host without gh/GitHub-SSH (e.g. the x86 sweep box) can reuse hives pre-indexed
+    elsewhere, reaching hosted NeoHive over CF only."""
     hives = _neohive_req("GET", "/api/hives")
     existing = next((h for h in hives.get("items", []) if h.get("name") == instance_id and h.get("type") == "repo"), None)
-    if existing:
-        hid = existing["id"]
-        cfgs = _neohive_req("GET", f"/api/hives/{hid}/sync-configs").get("items", [])
-        if any(c.get("last_indexed_sha") == base_commit for c in cfgs):
-            print(f"[index] reusing hive {hid} (already indexed at {base_commit[:12]})")
-            return hid
-        _neohive_req("DELETE", f"/api/hives/{hid}")  # exists but stale -> recreate
-        print(f"[index] deleted stale hive {hid} (not at base_commit); recreating")
+    if not existing:
+        return None
+    cfgs = _neohive_req("GET", f"/api/hives/{existing['id']}/sync-configs").get("items", [])
+    return existing["id"] if any(c.get("last_indexed_sha") == base_commit for c in cfgs) else None
+
+
+def index_into_neohive(instance_id: str, repo: str, https_url: str, branch: str, base_commit: str,
+                       poll_timeout: int) -> str:
+    # Idempotent: reuse an already-indexed hive; else delete a stale one and recreate.
+    hid = find_indexed_hive(instance_id, base_commit)
+    if hid:
+        print(f"[index] reusing hive {hid} (already indexed at {base_commit[:12]})")
+        return hid
+    hives = _neohive_req("GET", "/api/hives")
+    stale = next((h for h in hives.get("items", []) if h.get("name") == instance_id and h.get("type") == "repo"), None)
+    if stale:
+        _neohive_req("DELETE", f"/api/hives/{stale['id']}")  # exists but stale -> recreate
+        print(f"[index] deleted stale hive {stale['id']} (not at base_commit); recreating")
 
     hive = _neohive_req("POST", "/api/hives", {
         "name": instance_id,
@@ -228,6 +238,16 @@ def main() -> int:
     inst = load_instance(args.instance_id)
     repo, base_commit = inst["repo"], inst["base_commit"]
     cache = Path(args.workdir) / "repos" / repo.replace("/", "__")
+
+    # Short-circuit: if this instance's hive is already indexed on NeoHive, reuse it
+    # without cloning/mirroring/pushing (so a gh/SSH-less host can run off pre-indexed
+    # hives via CF alone). Indexing hosts (with gh + GitHub SSH) create them; run hosts reuse.
+    if not args.guard_only:
+        hid = find_indexed_hive(args.instance_id, base_commit)
+        if hid:
+            print(f"[index] reusing already-indexed hive {hid} (skip clone/mirror/publish)")
+            print(f"NEOHIVE_HIVE={hid}")
+            return 0
 
     ensure_repo_cache(repo, base_commit, cache)
     branch = make_branch(cache, args.instance_id, base_commit)

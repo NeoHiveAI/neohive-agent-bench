@@ -64,11 +64,15 @@ export default (async () => {
         if (!combined || combined.indexOf("No relevant memories found") !== -1) {
           process.stderr.write("[neohive-smart] recall returned nothing\n"); return
         }
+        // Prepend into an EXISTING text part rather than unshifting a bare
+        // {type,text} part: opencode's part schema requires id/sessionID/messageID on
+        // save, so a bare part throws SchemaError and fails the whole prompt. Mutating
+        // an existing part keeps those ids intact and still reaches the model.
+        const block = `NeoHive smart context (auto-recall over the indexed repo):\n${combined.slice(0, 4000)}`
+        const firstText = (output.parts || []).find((p) => p && p.type === "text" && typeof p.text === "string")
+        if (!firstText) { process.stderr.write("[neohive-smart] no text part to augment\n"); return }
+        firstText.text = `${block}\n\n---\n\n${firstText.text}`
         process.stderr.write(`[neohive-smart] injected ${combined.length} chars from memory_recall\n`)
-        output.parts.unshift({
-          type: "text",
-          text: `NeoHive smart context (auto-recall over the indexed repo):\n${combined.slice(0, 4000)}`,
-        })
       } catch (e) {
         try { process.stderr.write("[neohive-smart] err " + e + "\n") } catch {}
       }

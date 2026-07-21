@@ -131,6 +131,17 @@ function scanConfigFile(path: string): string | undefined {
 export default (async ({ directory }) => {
   return {
     "tool.execute.before": async (input, _output) => {
+      // Compounding mode (HIVE-335): the ONLY write path is the host-side,
+      // filter-gated reflect-and-store step. Block the agent's own direct
+      // memory_store so an unfiltered verbatim answer can't reach the hive. Off
+      // unless the harness sets NEOHIVE_AGENT_WRITE_DISABLED=1, so single-pass is
+      // unaffected.
+      if (process.env.NEOHIVE_AGENT_WRITE_DISABLED === "1" &&
+          typeof input.tool === "string" && /(^|[_.])memory_store$/.test(input.tool)) {
+        throw new Error(
+          "[neohive] Direct memory_store is disabled in compounding mode; learnings are " +
+          "written by the host-side, filter-gated reflect-and-store step (HIVE-335/336).")
+      }
       if (process.env.NEOHIVE_PRETOOL_DISABLED === "1") return
       if (!TOOLS_TO_NUDGE.has(input.tool)) return
 

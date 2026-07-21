@@ -36,6 +36,8 @@ import time
 from pathlib import Path
 
 import index_instance as idx  # reuse the NeoHive API client + dataset loader
+from neohive_rest import NeoHiveClient  # HIVE-335 host-side write path
+from reflect_and_store import reflect_and_store
 
 HERE = Path(__file__).resolve().parent
 TASK_TEMPLATE = """<issue>
@@ -126,7 +128,36 @@ this project hold unrelated repos).
     ocj.write_text(json.dumps(cfg, indent=2))
 
 
-NEOHIVE_TOOLS = ["neohive_memory_recall", "neohive_memory_context", "neohive_memory_store",
+def write_routing_compounding(cfgdir: Path, repo: str, base_commit: str, hive_id: str) -> None:
+    """Compounding-mode routing (HIVE-334/335). Unlike single-pass `write_routing`, the
+    agent recalls ACROSS this career project's hives — the repo's code index (`hive_id`)
+    AND the accumulated experience pool (the project's Knowledge hive that reflect-and-
+    store writes to each round) — so learnings from earlier rounds are retrievable. It
+    therefore does NOT pin a single `hive:` scope. Because the project holds only this
+    one repo's code + its own experience pool, cross-hive recall stays leakage-clean."""
+    routing = f"""# NeoHive routing (compounding career project)
+
+Your working directory (`/testbed`) is **{repo} @ {base_commit}**, whose source is
+indexed in hive **`{hive_id}`**. This project ALSO holds an accumulated *experience
+pool* (the Knowledge hive) written from earlier rounds solving other issues in this
+same repository.
+
+When you call `memory_recall` / `memory_context`, do NOT restrict to a single hive —
+recall across this project's hives so you get BOTH the repo's source and prior
+transferable lessons. Everything here is the same repository at or before your
+checkout, so it applies directly.
+"""
+    (cfgdir / "instructions").mkdir(exist_ok=True)
+    (cfgdir / "instructions" / "neohive-routing.md").write_text(routing)
+    ocj = cfgdir / "opencode.json"
+    cfg = json.loads(ocj.read_text())
+    instr = cfg.setdefault("instructions", [])
+    if "instructions/neohive-routing.md" not in instr:
+        instr.append("instructions/neohive-routing.md")
+    ocj.write_text(json.dumps(cfg, indent=2))
+
+
+NEOHIVE_TOOLS =["neohive_memory_recall", "neohive_memory_context", "neohive_memory_store",
                  "neohive_list_hives", "neohive_memory_stats"]
 
 
@@ -199,17 +230,27 @@ def build_config_dir(arm: str, project: str | None) -> Path:
 
 
 def run_instance(instance_id: str, arm: str, model: str, ocbin: str, nodedir: str, out_dir: Path,
-                 timeout: int, project: str | None) -> None:
+                 timeout: int, project: str | None,
+                 compounding: bool = False, twin: bool = False) -> None:
     inst = idx.load_instance(instance_id)
     image = image_for(instance_id)
     inst_dir = out_dir / instance_id
     inst_dir.mkdir(parents=True, exist_ok=True)
     hive_id = None
+    # Modes (all arm-b only; both default False => untouched single-pass A/B behaviour):
+    #   career_mode = recall across the career project's hives (repo code + experience pool)
+    #   writes_on   = run the HIVE-335 reflect-and-store write path after the task (treated)
+    #   twin        = same scaffold + cross-hive recall but writes OFF (HIVE-338 control)
+    career_mode = arm == "b" and (compounding or twin)
+    writes_on = arm == "b" and compounding and not twin
 
     cfgdir = build_config_dir(arm, project)
     if arm == "b":
         hive_id = index_instance(instance_id)  # idempotent; hives persist (multi-repo project)
-        write_routing(cfgdir, inst["repo"], inst["base_commit"], hive_id)
+        if career_mode:
+            write_routing_compounding(cfgdir, inst["repo"], inst["base_commit"], hive_id)
+        else:
+            write_routing(cfgdir, inst["repo"], inst["base_commit"], hive_id)
 
     print(f"[run] arm={arm} {instance_id} model={model} image={image}" + (f" hive={hive_id}" if hive_id else ""))
     # Mount opencode + node read-only. Config goes PROJECT-level into /testbed (opencode
@@ -230,8 +271,16 @@ def run_instance(instance_id: str, arm: str, model: str, ocbin: str, nodedir: st
         if arm == "b":
             mcp_url = f"{os.environ.get('NEOHIVE_BASE', 'https://neohive.logilica.com').rstrip('/')}/projects/{project}/mcp"
             env_flags += ["-e", "NEOHIVE_CF_ACCESS_CLIENT_ID", "-e", "NEOHIVE_CF_ACCESS_CLIENT_SECRET",
-                          "-e", f"NEOHIVE_HIVE={hive_id}",       # scope recall + smart-prompts to this hive
                           "-e", f"NEOHIVE_MCP_URL={mcp_url}"]    # smart-prompts plugin calls this directly
+            if career_mode:
+                # Cross-hive recall within the career project: DON'T pin NEOHIVE_HIVE, so
+                # smart-prompts + the agent see the repo code index AND the experience pool.
+                if writes_on:
+                    # Only the host-side, filter-gated reflect step may write; block the
+                    # agent's own unfiltered memory_store (guarded in plugin/neohive.ts).
+                    env_flags += ["-e", "NEOHIVE_AGENT_WRITE_DISABLED=1"]
+            else:
+                env_flags += ["-e", f"NEOHIVE_HIVE={hive_id}"]  # single-pass: scope recall to this repo hive
         task = TASK_TEMPLATE.format(problem_statement=inst["problem_statement"])
         # --format json => raw event stream (tool calls etc.) for usage telemetry;
         # --print-logs => plugin activity (smart-prompts, grep-nudge) on stderr.
@@ -258,6 +307,8 @@ def run_instance(instance_id: str, arm: str, model: str, ocbin: str, nodedir: st
             (inst_dir / "usage.json").write_text(json.dumps(usage, indent=2))
             usage_str = (f" neohive_used={usage['used_neohive']}"
                          f" recall~{usage['neohive_memory_recall']} smartctx={usage['smart_context_injections']}")
+        if writes_on:
+            usage_str += reflect_after_task(inst, events + "\n" + errlog, diff, status, project, inst_dir)
         print(f"[run] {instance_id} arm={arm} status={status} patch_len={len(diff)}{usage_str}")
     finally:
         docker("rm", "-f", cid, check=False)
@@ -270,6 +321,27 @@ def update_preds(path: Path, instance_id: str, model: str, patch: str) -> None:
     path.write_text(json.dumps(data, indent=2))
 
 
+def reflect_after_task(inst: dict, transcript: str, diff: str, status: str,
+                       project: str | None, inst_dir: Path) -> str:
+    """HIVE-335: host-side, filter-gated reflect-and-store after a task. Writes the
+    surviving transferable learnings to the career project's Knowledge hive on the
+    LOCAL NeoHive instance (NEOHIVE_HOST_BASE, default http://127.0.0.1:3577 — the host
+    reaches its own instance directly, while the in-container smart-prompts uses
+    NEOHIVE_MCP_URL). Returns a short log suffix; never raises (a write-path hiccup must
+    not fail the instance)."""
+    try:
+        host_base = os.environ.get("NEOHIVE_HOST_BASE", "http://127.0.0.1:3577")
+        client = NeoHiveClient(base=host_base, project=project,
+                               cf_id=os.environ.get("NEOHIVE_CF_ACCESS_CLIENT_ID"),
+                               cf_secret=os.environ.get("NEOHIVE_CF_ACCESS_CLIENT_SECRET"))
+        rr = reflect_and_store(client, inst, transcript, diff, status)
+        (inst_dir / "reflection.json").write_text(json.dumps(rr.as_dict(), indent=2))
+        return f" reflect(stored={rr.stored},blocked={rr.blocked}{',err' if rr.error else ''})"
+    except Exception as e:  # noqa: BLE001 — writes must never fail the instance
+        sys.stderr.write(f"[run] reflect-and-store failed: {e}\n")
+        return " reflect(failed)"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run opencode per SWE-bench instance, per arm (in-container).")
     ap.add_argument("instance_ids", nargs="+")
@@ -277,10 +349,20 @@ def main() -> int:
     ap.add_argument("--model", required=True, help="e.g. openrouter/z-ai/glm-4.6")
     ap.add_argument("--timeout", type=int, default=1200, help="per-instance opencode wall-clock budget (s)")
     ap.add_argument("--output", default="")
+    ap.add_argument("--compounding", action="store_true",
+                    help="HIVE-334/335: persistent-career mode — cross-hive recall within the career "
+                         "project + filter-gated reflect-and-store after each task (arm b only).")
+    ap.add_argument("--twin", action="store_true",
+                    help="HIVE-338: memoryless twin — same arm-b scaffold + cross-hive recall but "
+                         "writes OFF, so the experience pool never accumulates (arm b only).")
     args = ap.parse_args()
 
     if not os.environ.get("OPENROUTER_API_KEY"):
         raise SystemExit("set OPENROUTER_API_KEY")
+    if (args.compounding or args.twin) and args.arm != "b":
+        raise SystemExit("--compounding/--twin require --arm b")
+    if args.compounding and args.twin:
+        raise SystemExit("--compounding and --twin are mutually exclusive")
     project = os.environ.get("NEOHIVE_PROJECT")
     ocbin = opencode_bin()
     nodedir = node_dir()
@@ -292,7 +374,8 @@ def main() -> int:
 
     for iid in args.instance_ids:
         try:
-            run_instance(iid, args.arm, args.model, ocbin, nodedir, out_dir, args.timeout, project)
+            run_instance(iid, args.arm, args.model, ocbin, nodedir, out_dir, args.timeout, project,
+                         compounding=args.compounding, twin=args.twin)
         except Exception as e:  # noqa: BLE001 — keep going across instances
             print(f"[run] ERROR on {iid}: {e}", file=sys.stderr)
 

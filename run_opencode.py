@@ -8,8 +8,9 @@ natively — the faithful end-user experience. Both arms run opencode inside the
 per-instance SWE-bench image so the agent has the repo's deps and can run tests.
 
 Per instance:
-  - (Arm B) isolate + index: delete any existing hives in the project, then
-    `index_instance.py <id>` to index repo@base_commit into a fresh hive.
+  - (Arm B) resolve the hive: `index_instance.py <id>` indexes/reuses ONE hive per
+    repo at that repo's oldest pilot base_commit (leakage-safe; ancestor of all its
+    instances). Idempotent — first instance of a repo indexes it, the rest reuse it.
   - docker run the image with the pinned opencode binary mounted (-v ...:ro).
   - docker cp the arm's opencode.json to /root/.config/opencode/ (OUTSIDE /testbed,
     so it never lands in the diff).
@@ -86,7 +87,12 @@ def write_routing(cfgdir: Path, repo: str, base_commit: str, hive_id: str) -> No
     block" idea) and register it as an opencode instruction. Multiple repos coexist
     in one project (real NeoHive usage); this tells the agent which hive holds
     /testbed's repo and to scope recall to it — routing + the contamination guard in
-    one. No per-run hive teardown."""
+    one. Hives persist and are reused across runs (no per-run teardown).
+
+    Each hive indexes its repo at a commit that is an ancestor of every routed instance's
+    base_commit (leakage-safe) — the repo's oldest pilot base for most repos, or the
+    instance's own base where a repo's instances diverge. So the index is at or before
+    /testbed's checkout of the same repository; semantic recall over its source applies."""
     rows = []
     for h in project_hives():
         if h.get("type") != "repo":
@@ -97,15 +103,16 @@ def write_routing(cfgdir: Path, repo: str, base_commit: str, hive_id: str) -> No
     table = "\n".join(rows) if rows else "| (none) | | |"
     routing = f"""# NeoHive hive routing (this project)
 
-This NeoHive project indexes one repository per hive, each pinned at a fixed commit.
-The repository in your working directory (`/testbed`) is **{repo} @ {base_commit}**,
-indexed in hive **`{hive_id}`**.
+This NeoHive project indexes one repository per hive. Your working directory
+(`/testbed`) is **{repo} @ {base_commit}**. That repository is indexed in hive
+**`{hive_id}`** (pinned at a commit of the *same* repo at or before your checkout — same
+modules, same APIs, so semantic recall over its source applies directly).
 
 When you call the NeoHive `memory_recall` / `memory_context` MCP tools, ALWAYS pass
 `hive: "{hive_id}"` so results come only from this repository's index (other hives in
-this project hold unrelated repos / commits).
+this project hold unrelated repos).
 
-| hive id | name (instance) | |
+| hive id | name (repo) | |
 |---|---|---|
 {table}
 """

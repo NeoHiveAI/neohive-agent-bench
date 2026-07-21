@@ -6,8 +6,9 @@ experience pool that the agent reads *and* writes across rounds, so resolve rate
 **treated-vs-memoryless-twin trend**, not a single score — the signal is the *slope*
 across rounds and the *gap* to the twin.
 
-The single-pass A/B path is unchanged: everything here is behind flags
-(`--compounding` / `--twin`), off by default.
+**Compounding is the DEFAULT for arm B.** The old read-only single-pass A/B is now an
+opt-out (`--single-pass`), and `--twin` selects the memory-off control. Arm A (stock, no
+NeoHive) is unchanged.
 
 ## Target: a LOCAL NeoHive on the run host
 
@@ -54,7 +55,7 @@ Verified against the running server + indexed server code:
 | 341 | `models.json`, `models.py` | pinned agent set + GLM-4.6 fixed helper + seeds |
 | 342 | `cl_metrics.py` | GEM (ACC/BWT/FWT/forgetting) + improvement-curve slope + treated-vs-twin gap |
 | 343 | `grading.py` | post-process the STOCK swebench report; apply-failures in their own bucket |
-| integration | `run_opencode.py` | `--compounding` / `--twin` flags; single-pass untouched when off |
+| integration | `run_opencode.py` | arm-b **default = compounding**; `--single-pass` opt-out; `--twin` control |
 
 Tests: `python3 -m unittest discover -s tests -p 'test_*.py'` (62 tests, stdlib-only, no venv).
 

@@ -136,14 +136,16 @@ def run_career(config: RoundsConfig, *, executor, grader, snapshotter) -> Career
 # --------------------------------------------------------------------------- #
 
 def default_executor(slc, round_idx, config: RoundsConfig):
-    """Run a slice through run_opencode.py in the career project. treated =>
-    --compounding; twin => --twin. Same command shape for both (only the flag +
-    project differ), so the scaffold is held constant."""
-    mode_flag = "--compounding" if config.mode == "treated" else "--twin"
+    """Run a slice through run_opencode.py in the career project. treated => arm-b
+    default (compounding, no flag); twin => --twin. Same command shape for both (only
+    the twin flag + project differ), so the scaffold is held constant."""
     out = Path(config.output_dir or (HERE / "results")) / f"{config.mode}-round{round_idx}"
     env = dict(os.environ, NEOHIVE_PROJECT=config.project or "")
     cmd = [str(HERE / ".venv/bin/python"), str(HERE / "run_opencode.py"),
-           "--arm", "b", mode_flag, "--model", config.model, "--output", str(out), *slc]
+           "--arm", "b", "--model", config.model, "--output", str(out)]
+    if config.mode == "twin":
+        cmd.append("--twin")   # treated relies on the compounding default
+    cmd += list(slc)
     subprocess.run(cmd, check=True, env=env)
     return out / "preds.json"
 

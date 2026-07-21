@@ -231,18 +231,18 @@ def build_config_dir(arm: str, project: str | None) -> Path:
 
 def run_instance(instance_id: str, arm: str, model: str, ocbin: str, nodedir: str, out_dir: Path,
                  timeout: int, project: str | None,
-                 compounding: bool = False, twin: bool = False) -> None:
+                 single_pass: bool = False, twin: bool = False) -> None:
     inst = idx.load_instance(instance_id)
     image = image_for(instance_id)
     inst_dir = out_dir / instance_id
     inst_dir.mkdir(parents=True, exist_ok=True)
     hive_id = None
-    # Modes (all arm-b only; both default False => untouched single-pass A/B behaviour):
+    # Arm B DEFAULTS to the compounding loop. Opt out with single_pass (old read-only,
+    # repo-hive-scoped behaviour); twin is the memory-off control. (Arm A is stock.)
     #   career_mode = recall across the career project's hives (repo code + experience pool)
     #   writes_on   = run the HIVE-335 reflect-and-store write path after the task (treated)
-    #   twin        = same scaffold + cross-hive recall but writes OFF (HIVE-338 control)
-    career_mode = arm == "b" and (compounding or twin)
-    writes_on = arm == "b" and compounding and not twin
+    career_mode = arm == "b" and not single_pass
+    writes_on = career_mode and not twin
 
     cfgdir = build_config_dir(arm, project)
     if arm == "b":
@@ -349,20 +349,20 @@ def main() -> int:
     ap.add_argument("--model", required=True, help="e.g. openrouter/z-ai/glm-4.6")
     ap.add_argument("--timeout", type=int, default=1200, help="per-instance opencode wall-clock budget (s)")
     ap.add_argument("--output", default="")
-    ap.add_argument("--compounding", action="store_true",
-                    help="HIVE-334/335: persistent-career mode — cross-hive recall within the career "
-                         "project + filter-gated reflect-and-store after each task (arm b only).")
+    ap.add_argument("--single-pass", action="store_true",
+                    help="Arm-B opt-out (HIVE-334/335 default is the compounding loop): restore the "
+                         "old read-only single-pass A/B — repo-hive-scoped recall, no writes.")
     ap.add_argument("--twin", action="store_true",
-                    help="HIVE-338: memoryless twin — same arm-b scaffold + cross-hive recall but "
-                         "writes OFF, so the experience pool never accumulates (arm b only).")
+                    help="HIVE-338: memoryless twin — the arm-b compounding scaffold + cross-hive "
+                         "recall but writes OFF, so the experience pool never accumulates (arm b only).")
     args = ap.parse_args()
 
     if not os.environ.get("OPENROUTER_API_KEY"):
         raise SystemExit("set OPENROUTER_API_KEY")
-    if (args.compounding or args.twin) and args.arm != "b":
-        raise SystemExit("--compounding/--twin require --arm b")
-    if args.compounding and args.twin:
-        raise SystemExit("--compounding and --twin are mutually exclusive")
+    if args.twin and args.arm != "b":
+        raise SystemExit("--twin requires --arm b")
+    if args.single_pass and args.twin:
+        raise SystemExit("--single-pass and --twin are mutually exclusive")
     project = os.environ.get("NEOHIVE_PROJECT")
     ocbin = opencode_bin()
     nodedir = node_dir()
@@ -375,7 +375,7 @@ def main() -> int:
     for iid in args.instance_ids:
         try:
             run_instance(iid, args.arm, args.model, ocbin, nodedir, out_dir, args.timeout, project,
-                         compounding=args.compounding, twin=args.twin)
+                         single_pass=args.single_pass, twin=args.twin)
         except Exception as e:  # noqa: BLE001 — keep going across instances
             print(f"[run] ERROR on {iid}: {e}", file=sys.stderr)
 

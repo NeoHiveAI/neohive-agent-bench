@@ -171,6 +171,24 @@ Both are secrets the operator holds; place them on olympus (mode 600):
    `pnpm install` MemVec `main` (which depends on the private `@logilica/logging`).
    Without it the dev-image build 401s.
 2. **`~/.openrouter_key`** — the OpenRouter API key. Required for the agent models
-   (`moonshotai/kimi-k2.7`, `z-ai/glm-5.2`, `minimax/minimax-m3`,
-   `anthropic/claude-sonnet-5`) and the fixed GLM-4.6 rewriter/reflect helper, i.e.
-   for both the per-slug completion checks and any opencode run.
+   and the fixed GLM-4.6 rewriter/reflect helper (per-slug checks + every opencode run).
+   **The account must be FUNDED, not just valid.** OpenRouter reserves credit equal to
+   a request's `max_tokens`; opencode requests up to 32000, so a free/low-balance
+   account 402s (`"requires more credits, or fewer max_tokens"`) on real agent runs
+   even though `max_tokens=1` probes succeed. Top up / upgrade to a paid account.
+
+## Operational findings (verified 2026-07-22, HIVE-339)
+
+| Check | Result |
+|---|---|
+| 1 — box | x86_64, i9-9900K/16T, 31 GiB RAM; `/` freed to ~83 GB (`docker builder prune` reclaimed 56 GB); 901 GB spare `/mnt/data` |
+| 2 — Docker | 29.3.0, `linux/amd64`, `hello-world` native `(amd64)`, `nader` in `docker` group |
+| 3 — NeoHive | dev-mode gateway on `127.0.0.1:3577` (MemVec `main`); harness `list_hives` succeeds locally |
+| 4 — model slugs | key valid; **4/5 pinned slugs resolve.** `moonshotai/kimi-k2.7` is INVALID (HTTP 400) — OpenRouter serves `moonshotai/kimi-k2.7-code` (also `kimi-k2.6`, `kimi-k3`). Fix the pin in `models.json` (HIVE-341). |
+| 5 — tests | 62/62 pass |
+| 6 — django smoke | container runs **natively (no qemu)**; stock `swebench` grading returns a report. A non-empty solve needs the OpenRouter account funded (see above). |
+| 7 — detached runs | documented above |
+
+**Embedder note:** the dev-compose `build` target omits the Rust embedder, so
+`memory_store`/`memory_recall`/indexing (Arm B) need the x86 embedder built + mounted
+(see the NeoHive section). `list_hives` and the Arm-A smoke do not require it.

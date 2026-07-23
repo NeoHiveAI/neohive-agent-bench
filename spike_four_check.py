@@ -163,9 +163,14 @@ def grade_career(preds_path: Path, run_id: str, model: str, instance_ids: list[s
     if dry_run:
         verdicts = [grading.InstanceVerdict(i, grading.UNRESOLVED) for i in instance_ids]
         return {"stock": {"stub": True}, "buckets": grading.summarize(verdicts).as_dict()}
-    subprocess.run([str(HERE / "grade_swebench.sh"), str(preds_path), run_id, "2"], check=True)
-    report = HERE / "results" / f"{model.replace('/', '_')}.{run_id}.json"
-    logs = HERE / "logs" / "run_evaluation" / run_id / model.replace("/", "_")
+    subprocess.run([str(HERE / "grade_swebench.sh"), str(preds_path), run_id, "2"], check=True, cwd=str(HERE))
+    # swebench ignores --report_dir and writes "<model with / -> __>.<run_id>.json" to CWD
+    # (confirmed on olympus). Glob by run_id so any model-slug transform is matched.
+    cands = sorted(HERE.glob(f"*{run_id}.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    report = cands[0] if cands else HERE / f"{model.replace('/', '__')}.{run_id}.json"
+    run_logs = HERE / "logs" / "run_evaluation" / run_id
+    model_dirs = [d for d in run_logs.iterdir() if d.is_dir()] if run_logs.exists() else []
+    logs = model_dirs[0] if model_dirs else run_logs / model.replace("/", "__")
     stock = json.loads(report.read_text()) if report.exists() else {}
     buckets = grading.grade_report(report, logs_dir=logs, instance_ids=instance_ids).as_dict()
     return {"stock_report": str(report), "stock_counts": {

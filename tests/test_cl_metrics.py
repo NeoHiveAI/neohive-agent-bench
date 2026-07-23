@@ -10,13 +10,16 @@ import unittest
 from cl_metrics import (
     average_accuracy,
     backward_transfer,
+    build_report,
     effort_per_solve,
     forgetting,
     forward_transfer,
     gem_metrics,
     improvement_curve,
     ols_slope,
+    render_report,
     resolve_rate,
+    series_from_career,
 )
 
 # R[i][j] = resolve rate on slice j after accumulating through round i
@@ -88,6 +91,47 @@ class GemMetricTests(unittest.TestCase):
             average_accuracy([[0.1, 0.2]])  # non-square
         with self.assertRaises(ValueError):
             forward_transfer(R, [0.1, 0.1])  # baseline wrong length
+
+
+class ReportTests(unittest.TestCase):
+    """HIVE-342 report CLI: treated + twin careers -> improvement-curve payload."""
+
+    TREATED = {"repo": "django/django", "mode": "treated", "model": "z-ai/glm-5.2",
+               "resolve_series": [0.2, 0.4, 0.6]}
+    TWIN = {"repo": "django/django", "mode": "twin", "model": "z-ai/glm-5.2",
+            "resolve_series": [0.2, 0.25, 0.2]}
+
+    def test_series_prefers_resolve_series(self):
+        self.assertEqual(series_from_career(self.TREATED), [0.2, 0.4, 0.6])
+
+    def test_series_recomputes_from_rounds_when_no_series(self):
+        career = {"rounds": [{"grading": {"resolve_rate": 0.3}},
+                             {"grading": {"resolve_rate": 0.5}}]}
+        self.assertEqual(series_from_career(career), [0.3, 0.5])
+
+    def test_report_slopes_gap_and_signal(self):
+        payload = build_report(self.TREATED, self.TWIN)
+        self.assertAlmostEqual(payload["treated"]["slope"], 0.2)
+        self.assertAlmostEqual(payload["twin"]["slope"], 0.0)
+        self.assertAlmostEqual(payload["mean_gap"], 0.55 / 3)
+        # treated rising AND above the flat twin => the compounding read fires
+        self.assertTrue(payload["compounding_signal"])
+
+    def test_flat_treated_gives_no_signal(self):
+        flat = {"repo": "django/django", "mode": "treated", "resolve_series": [0.3, 0.3, 0.3]}
+        payload = build_report(flat, self.TWIN)
+        self.assertFalse(payload["compounding_signal"])
+
+    def test_report_includes_gem_when_matrix_given(self):
+        payload = build_report(self.TREATED, self.TWIN, R=R, baseline=BASELINE)
+        self.assertIn("gem", payload)
+        self.assertAlmostEqual(payload["gem"]["forward_transfer"], 0.05)
+
+    def test_render_is_stringy_and_mentions_both_arms(self):
+        text = render_report(build_report(self.TREATED, self.TWIN))
+        self.assertIn("treated", text)
+        self.assertIn("twin", text)
+        self.assertIn("compounding signal", text)
 
 
 if __name__ == "__main__":

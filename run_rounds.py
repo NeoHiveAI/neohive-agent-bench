@@ -154,9 +154,12 @@ def default_grader(slc, round_idx, config: RoundsConfig) -> grading.GradingSumma
     out = Path(config.output_dir or (HERE / "results")) / f"{config.mode}-round{round_idx}"
     preds = out / "preds.json"
     run_id = f"{config.repo.replace('/', '_')}-{config.mode}-r{round_idx}"
-    subprocess.run([str(HERE / "grade_swebench.sh"), str(preds), run_id, "2"], check=True)
-    report = HERE / "results" / f"{config.model.replace('/', '_')}.{run_id}.json"
-    logs = HERE / "logs" / "run_evaluation" / run_id / config.model.replace("/", "_")
+    subprocess.run([str(HERE / "grade_swebench.sh"), str(preds), run_id, "2"], check=True, cwd=str(HERE))
+    # swebench writes "<model with / -> __>.<run_id>.json" to CWD (ignores --report_dir),
+    # and logs under run_evaluation/<run_id>/<model with / -> __>/ (confirmed on olympus).
+    cands = sorted(HERE.glob(f"*{run_id}.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    report = cands[0] if cands else HERE / f"{config.model.replace('/', '__')}.{run_id}.json"
+    logs = HERE / "logs" / "run_evaluation" / run_id / config.model.replace("/", "__")
     return grading.grade_report(report, logs_dir=logs, instance_ids=list(slc))
 
 

@@ -1,7 +1,7 @@
 {
   "_note": "HIVE-341 — pinned model set + seeds for the compounding run. Supersedes the HIVE-266 lineup (DeepSeek/GLM-4.6/Kimi-K2.5/GPT-5.5/Opus). OpenRouter slugs are best-effort and MUST be verified against the live OpenRouter model list before a run (see README caution).",
   "agent_models": [
-    {"name": "Kimi K2.7",  "openrouter": "moonshotai/kimi-k2.7", "role": "agent"},
+    {"name": "Kimi K2.7",  "openrouter": "moonshotai/kimi-k2.7-code", "role": "agent"},
     {"name": "GLM-5.2",    "openrouter": "z-ai/glm-5.2",         "role": "agent"},
     {"name": "MiniMax-M3", "openrouter": "minimax/minimax-m3",   "role": "agent"},
     {"name": "Sonnet 5",   "openrouter": "anthropic/claude-sonnet-5", "role": "agent+frontier_reference"}
